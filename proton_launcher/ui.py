@@ -1,0 +1,1403 @@
+# SPDX-License-Identifier: GPL-3.0-only
+from __future__ import annotations
+
+import shlex
+import shutil
+import subprocess
+import uuid
+from dataclasses import replace
+from pathlib import Path
+
+from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtGui import (
+    QAction,
+    QCloseEvent,
+    QDesktopServices,
+    QFontDatabase,
+    QIcon,
+)
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QScrollArea,
+    QSplitter,
+    QSystemTrayIcon,
+    QTabWidget,
+    QToolBar,
+    QVBoxLayout,
+    QWidget,
+)
+
+from .models import GameEntry, LaunchProfile, ProtonInstallation
+from .process_watcher import find_matching_pids, primary_executable_name
+from .profiles import DEFAULT_PROFILE_ID, ConfigStore
+from .proton import (
+    discover_protons,
+    discover_steam_default_tool,
+    read_prefix_metadata,
+    resolve_proton_choice,
+)
+from .runner import (
+    build_followup_launch_spec,
+    build_launch_spec,
+    build_steam_launch_spec,
+    clean_process_output,
+    parse_environment_text,
+    prepare_compatdata_directory,
+)
+from .sessions import SessionKind, SessionManager, SessionRecord
+from .settings_dialog import SettingsDialog
+from .steam import discover_games, discover_libraries, discover_steam_roots
+from .wemod_bridge import reset_wemod_prefix
+
+APP_ICON = Path(__file__).resolve().parent.parent / "assets" / "proton-launcher.svg"
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, store: ConfigStore | None = None):
+        super().__init__()
+        self.setWindowTitle("Proton Launcher")
+        self.resize(980, 760)
+        icon = QIcon(str(APP_ICON))
+        self.setWindowIcon(
+            icon if not icon.isNull() else QIcon.fromTheme("applications-games")
+        )
+        self.store = store or ConfigStore()
+        self.sessions = SessionManager()
+        self.games: list[GameEntry] = []
+        self.protons: list[ProtonInstallation] = []
+        self.steam_roots: list[Path] = []
+        self.libraries: list[Path] = []
+        self.steam_default_tool = ""
+        self.default_proton: ProtonInstallation | None = None
+        self.current_profile: LaunchProfile | None = None
+        self.loading_profile = False
+        self.named_profile_dirty = False
+        self.session_records: dict[str, SessionRecord] = {}
+        self.log_offsets: dict[str, int] = {}
+        self._force_quit = False
+
+        self.autosave_timer = QTimer(self)
+        self.autosave_timer.setSingleShot(True)
+        self.autosave_timer.setInterval(500)
+        self.autosave_timer.timeout.connect(self._autosave_default)
+        self.session_timer = QTimer(self)
+        self.session_timer.setInterval(750)
+        self.session_timer.timeout.connect(self._refresh_sessions)
+
+        self._build_ui()
+        self._build_tray()
+        self._connect_profile_signals()
+        if self.store.read_only:
+            self._log(
+                "Configuration recovery mode: changes are temporary and read-only"
+            )
+        for issue in self.store.validation_issues:
+            self._log(f"Configuration repair: {issue.path}: {issue.message}")
+        self.refresh()
+        self.session_timer.start()
+        if not self.sessions.systemd_available:
+            self._log(
+                "Warning: user systemd is unavailable; using degraded process-group supervision"
+            )
+
+    def _build_ui(self) -> None:
+        file_menu = self.menuBar().addMenu("File")
+        settings_action = file_menu.addAction("Settings…")
+        settings_action.triggered.connect(self.open_settings)
+        quit_action = file_menu.addAction("Quit")
+        quit_action.triggered.connect(self._quit_from_menu)
+        tools_menu = self.menuBar().addMenu("Tools")
+        copy_options = tools_menu.addAction("Copy Steam Launch Options")
+        copy_options.triggered.connect(self.copy_steam_launch_options)
+
+        toolbar = QToolBar("Actions", self)
+        toolbar.setMovable(False)
+        toolbar.setFloatable(False)
+        self.addToolBar(toolbar)
+        for text, callback in (
+            ("Refresh", self.refresh),
+            ("Settings…", self.open_settings),
+            ("Set prefix…", self.set_prefix),
+            ("Open prefix", self.open_prefix),
+            ("Delete prefix…", self.delete_prefix),
+        ):
+            action = QAction(text, self)
+            action.triggered.connect(callback)
+            toolbar.addAction(action)
+            if text == "Delete prefix…":
+                self.delete_prefix_action = action
+            elif text == "Open prefix":
+                self.open_prefix_action = action
+
+        top = QWidget()
+        form = QFormLayout(top)
+        self.game_combo = QComboBox()
+        self.game_combo.setEditable(True)
+        self.game_combo.setInsertPolicy(QComboBox.NoInsert)
+        self.game_combo.currentIndexChanged.connect(self.game_changed)
+        game_row = QHBoxLayout()
+        game_row.addWidget(self.game_combo, 1)
+        self.prefix_badge = QLabel("Prefix: not selected")
+        self.prefix_badge.setStyleSheet(
+            "padding: 3px 7px; border: 1px solid palette(mid); border-radius: 5px;"
+        )
+        game_row.addWidget(self.prefix_badge)
+        self.game_count_label = QLabel()
+        self.game_count_label.setStyleSheet("color: palette(mid);")
+        game_row.addWidget(self.game_count_label)
+        form.addRow("Game", game_row)
+
+        self.proton_combo = QComboBox()
+        self.proton_combo.currentIndexChanged.connect(self._update_proton_tooltip)
+        proton_row = QHBoxLayout()
+        proton_row.addWidget(self.proton_combo, 1)
+        self.proton_count_label = QLabel()
+        self.proton_count_label.setStyleSheet("color: palette(mid);")
+        proton_row.addWidget(self.proton_count_label)
+        form.addRow("Proton", proton_row)
+
+        self.profile_combo = QComboBox()
+        self.profile_combo.currentIndexChanged.connect(self.profile_changed)
+        profile_row = QHBoxLayout()
+        profile_row.addWidget(self.profile_combo, 1)
+        for label, callback in (
+            ("New", self.new_profile),
+            ("Save", self.save_profile),
+            ("Duplicate", self.duplicate_profile),
+            ("Delete", self.delete_profile),
+        ):
+            button = QPushButton(label)
+            button.clicked.connect(callback)
+            profile_row.addWidget(button)
+            if label == "Save":
+                self.save_button = button
+            elif label == "Delete":
+                self.delete_button = button
+        form.addRow("Profile", profile_row)
+
+        self.steam_launch_checkbox = QCheckBox(
+            "Launch through Steam (enables Steam overlay/context)"
+        )
+        self.steam_launch_checkbox.toggled.connect(self._steam_launch_mode_changed)
+        form.addRow("", self.steam_launch_checkbox)
+        overlay_row = QHBoxLayout()
+        self.overlay_checkbox = QCheckBox("Inject Steam overlay into direct launch")
+        self.overlay_checkbox.toggled.connect(self._overlay_mode_changed)
+        overlay_row.addWidget(self.overlay_checkbox)
+        overlay_row.addWidget(QLabel("App ID"))
+        self.overlay_app_id_edit = QLineEdit()
+        self.overlay_app_id_edit.setMaximumWidth(100)
+        overlay_row.addWidget(self.overlay_app_id_edit)
+        overlay_row.addStretch()
+        form.addRow("", overlay_row)
+
+        self.tabs = QTabWidget()
+        self.tabs.currentChanged.connect(self._mode_changed)
+        executable_tab = QWidget()
+        executable_form = QFormLayout(executable_tab)
+        self.exe_edit = QLineEdit()
+        self.exe_edit.textChanged.connect(self._update_wait_target)
+        exe_row = QHBoxLayout()
+        exe_row.addWidget(self.exe_edit, 1)
+        browse = QPushButton("Browse…")
+        browse.clicked.connect(self.browse_executable)
+        exe_row.addWidget(browse)
+        executable_form.addRow("Executable", exe_row)
+        self.admin_checkbox = QCheckBox("Run as administrator")
+        executable_form.addRow("", self.admin_checkbox)
+        self.tabs.addTab(executable_tab, "Executable")
+
+        command_tab = QWidget()
+        command_layout = QVBoxLayout(command_tab)
+        preset_row = QHBoxLayout()
+        self.command_edit = QLineEdit()
+        for name, command in (
+            ("Explorer", "wine explorer ."),
+            ("Winecfg", "winecfg"),
+            ("Regedit", "regedit"),
+            ("CMD", "wineconsole cmd"),
+        ):
+            button = QPushButton(name)
+            button.clicked.connect(
+                lambda _checked=False, value=command: self.command_edit.setText(value)
+            )
+            preset_row.addWidget(button)
+        self.command_edit.setPlaceholderText("wine explorer")
+        self.command_edit.textChanged.connect(self._update_wait_target)
+        command_layout.addLayout(preset_row)
+        command_layout.addWidget(self.command_edit)
+        self.tabs.addTab(command_tab, "Command")
+
+        details = QWidget()
+        details_form = QFormLayout(details)
+        self.arguments_edit = QLineEdit()
+        self.arguments_edit.setPlaceholderText(
+            'Arguments, e.g. --flag "value with spaces"'
+        )
+        self.working_edit = QLineEdit()
+        work_row = QHBoxLayout()
+        work_row.addWidget(self.working_edit, 1)
+        work_browse = QPushButton("Browse…")
+        work_browse.clicked.connect(self.browse_working)
+        work_row.addWidget(work_browse)
+        self.online_fix_checkbox = QCheckBox("Apply online-fix overrides")
+        self.online_fix_checkbox.toggled.connect(self._online_fix_toggled)
+        self.wemod_checkbox = QCheckBox("Launch with WeMod")
+        self.wemod_checkbox.toggled.connect(self._wemod_mode_changed)
+        self.wemod_status = QLabel()
+        self.wemod_status.setStyleSheet("color: palette(mid);")
+        wemod_row = QHBoxLayout()
+        wemod_row.addWidget(self.wemod_checkbox)
+        wemod_row.addWidget(self.wemod_status, 1)
+        configure_wemod = QPushButton("Configure…")
+        configure_wemod.clicked.connect(
+            lambda _checked=False: self.open_settings("integrations")
+        )
+        wemod_row.addWidget(configure_wemod)
+        self.delete_wemod_button = QPushButton("Delete WeMod…")
+        self.delete_wemod_button.clicked.connect(self.delete_wemod)
+        wemod_row.addWidget(self.delete_wemod_button)
+        self.environment_edit = QPlainTextEdit()
+        self.environment_edit.setPlaceholderText("One NAME=value per line")
+        self.environment_edit.setMaximumHeight(100)
+        details_form.addRow("Arguments", self.arguments_edit)
+        details_form.addRow("Working directory", work_row)
+        details_form.addRow("", self.online_fix_checkbox)
+        details_form.addRow("", wemod_row)
+        details_form.addRow("Environment", self.environment_edit)
+
+        self.followup_group = QGroupBox("Follow-up launch")
+        self.followup_group.setCheckable(True)
+        self.followup_group.setChecked(False)
+        followup_form = QFormLayout(self.followup_group)
+        self.wait_exe_edit = QLineEdit()
+        self.wait_exe_edit.setPlaceholderText("Process name, e.g. Game.exe")
+        wait_row = QHBoxLayout()
+        wait_row.addWidget(self.wait_exe_edit, 1)
+        self.wait_primary_checkbox = QCheckBox("Use first executable")
+        self.wait_primary_checkbox.toggled.connect(self._update_wait_target)
+        wait_row.addWidget(self.wait_primary_checkbox)
+        self.followup_delay_spin = QDoubleSpinBox()
+        self.followup_delay_spin.setRange(0, 86400)
+        self.followup_delay_spin.setDecimals(1)
+        self.followup_delay_spin.setSuffix(" seconds")
+        self.followup_mode_combo = QComboBox()
+        self.followup_mode_combo.addItem("Executable", "executable")
+        self.followup_mode_combo.addItem("Command", "command")
+        self.followup_mode_combo.currentIndexChanged.connect(
+            self._followup_mode_changed
+        )
+        self.followup_target_edit = QLineEdit()
+        target_row = QHBoxLayout()
+        target_row.addWidget(self.followup_target_edit, 1)
+        self.followup_browse_button = QPushButton("Browse…")
+        self.followup_browse_button.clicked.connect(self.browse_followup)
+        target_row.addWidget(self.followup_browse_button)
+        self.followup_arguments_edit = QLineEdit()
+        self.followup_admin_checkbox = QCheckBox("Run follow-up as administrator")
+        self.followup_launch_now_button = QPushButton("Launch follow-up now")
+        self.followup_launch_now_button.clicked.connect(self.launch_followup_now)
+        followup_form.addRow("Wait for", wait_row)
+        followup_form.addRow("Then wait", self.followup_delay_spin)
+        followup_form.addRow("Launch type", self.followup_mode_combo)
+        followup_form.addRow("Executable / command", target_row)
+        followup_form.addRow("Arguments", self.followup_arguments_edit)
+        actions = QHBoxLayout()
+        actions.addWidget(self.followup_admin_checkbox)
+        actions.addStretch()
+        actions.addWidget(self.followup_launch_now_button)
+        followup_form.addRow("", actions)
+
+        editor = QWidget()
+        editor_layout = QVBoxLayout(editor)
+        editor_layout.addWidget(top)
+        editor_layout.addWidget(self.tabs)
+        editor_layout.addWidget(details)
+        editor_layout.addWidget(self.followup_group)
+        editor_layout.addStretch()
+        editor_scroll = QScrollArea()
+        editor_scroll.setWidgetResizable(True)
+        editor_scroll.setWidget(editor)
+
+        log_widget = QWidget()
+        log_layout = QVBoxLayout(log_widget)
+        log_controls = QHBoxLayout()
+        self.status = QLabel("Ready")
+        log_controls.addWidget(self.status, 1)
+        self.launch_button = QPushButton("Launch")
+        self.launch_button.setDefault(True)
+        self.launch_button.clicked.connect(self.launch)
+        log_controls.addWidget(self.launch_button)
+        self.stop_game_button = QPushButton("Stop Game")
+        self.stop_game_button.clicked.connect(self.stop_game)
+        log_controls.addWidget(self.stop_game_button)
+        self.stop_followup_button = QPushButton("Stop Follow-up")
+        self.stop_followup_button.clicked.connect(self.stop_followup)
+        log_controls.addWidget(self.stop_followup_button)
+        self.stop_all_button = QPushButton("Stop All")
+        self.stop_all_button.clicked.connect(self.stop_all)
+        log_controls.addWidget(self.stop_all_button)
+        clear = QPushButton("Clear")
+        clear.clicked.connect(lambda: self.log.clear())
+        log_controls.addWidget(clear)
+        copy = QPushButton("Copy")
+        copy.clicked.connect(
+            lambda: QApplication.clipboard().setText(self.log.toPlainText())
+        )
+        log_controls.addWidget(copy)
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(5000)
+        self.log.setFont(QFontDatabase.systemFont(QFontDatabase.FixedFont))
+        log_layout.addLayout(log_controls)
+        log_layout.addWidget(self.log)
+
+        splitter = QSplitter(Qt.Vertical)
+        splitter.addWidget(editor_scroll)
+        splitter.addWidget(log_widget)
+        splitter.setSizes([535, 225])
+        self.setCentralWidget(splitter)
+        self._followup_mode_changed()
+        self._update_session_buttons([])
+
+    def _build_tray(self) -> None:
+        self.tray = QSystemTrayIcon(self.windowIcon(), self)
+        menu = self.tray.contextMenu() or None
+        from PySide6.QtWidgets import QMenu
+
+        menu = QMenu(self)
+        show_action = menu.addAction("Show Proton Launcher")
+        show_action.triggered.connect(self._show_from_tray)
+        menu.addSeparator()
+        self.tray_stop_game = menu.addAction("Stop Game")
+        self.tray_stop_game.triggered.connect(self.stop_game)
+        self.tray_stop_followup = menu.addAction("Stop Follow-up")
+        self.tray_stop_followup.triggered.connect(self.stop_followup)
+        self.tray_stop_all = menu.addAction("Stop All")
+        self.tray_stop_all.triggered.connect(self.stop_all)
+        menu.addSeparator()
+        keep = menu.addAction("Quit and keep sessions")
+        keep.triggered.connect(self._quit_keep_sessions)
+        stop = menu.addAction("Stop all and quit")
+        stop.triggered.connect(self._stop_and_quit)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(
+            lambda reason: (
+                self._show_from_tray() if reason == QSystemTrayIcon.Trigger else None
+            )
+        )
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray.show()
+
+    def _connect_profile_signals(self) -> None:
+        for widget in (
+            self.exe_edit,
+            self.command_edit,
+            self.arguments_edit,
+            self.working_edit,
+            self.overlay_app_id_edit,
+            self.wait_exe_edit,
+            self.followup_target_edit,
+            self.followup_arguments_edit,
+        ):
+            widget.textChanged.connect(self._field_changed)
+        self.environment_edit.textChanged.connect(self._field_changed)
+        for widget in (
+            self.admin_checkbox,
+            self.steam_launch_checkbox,
+            self.overlay_checkbox,
+            self.online_fix_checkbox,
+            self.wemod_checkbox,
+            self.followup_group,
+            self.wait_primary_checkbox,
+            self.followup_admin_checkbox,
+        ):
+            widget.toggled.connect(self._field_changed)
+        self.proton_combo.currentIndexChanged.connect(self._field_changed)
+        self.tabs.currentChanged.connect(self._field_changed)
+        self.followup_mode_combo.currentIndexChanged.connect(self._field_changed)
+        self.followup_delay_spin.valueChanged.connect(self._field_changed)
+
+    def refresh(self) -> None:
+        selected = (
+            self.game_combo.currentData()
+            if self.game_combo.count()
+            else self.store.data["last_game"]
+        )
+        settings = self.store.settings
+        self.games, issues = discover_games(
+            settings["custom_steam_roots"], settings["custom_libraries"]
+        )
+        self.steam_roots = discover_steam_roots(settings["custom_steam_roots"])
+        self.libraries = []
+        for root in self.steam_roots:
+            self.libraries.extend(
+                discover_libraries(root, settings["custom_libraries"])
+            )
+        self.protons, proton_issues = discover_protons(
+            settings["custom_proton_locations"], self.steam_roots, self.libraries
+        )
+        self.steam_default_tool = discover_steam_default_tool(self.steam_roots)
+        self.default_proton, warning = resolve_proton_choice(
+            self.protons, settings["default_proton"], self.steam_default_tool
+        )
+        self.game_combo.blockSignals(True)
+        self.game_combo.clear()
+        for game in self.games:
+            self.game_combo.addItem(game.label, game.key)
+        self.game_combo.blockSignals(False)
+        index = self.game_combo.findData(selected)
+        self.game_combo.setCurrentIndex(
+            index if index >= 0 else (0 if self.games else -1)
+        )
+        self.game_count_label.setText(f"{len(self.games)} games")
+        self.proton_count_label.setText(f"{len(self.protons)} Proton versions")
+        for issue in [*issues, *proton_issues]:
+            self._log(f"Discovery warning: {issue.path}: {issue.message}")
+        if warning:
+            self._log(f"Proton default warning: {warning}")
+        self.game_changed()
+        self._update_wemod_status()
+
+    def current_game(self) -> GameEntry | None:
+        key = self.game_combo.currentData()
+        return next((game for game in self.games if game.key == key), None)
+
+    def game_changed(self, *_args) -> None:
+        if self.autosave_timer.isActive() and self.current_profile:
+            self._autosave_default()
+        game = self.current_game()
+        if not game:
+            self._update_wemod_status()
+            return
+        if (
+            self.named_profile_dirty
+            and self.current_profile
+            and self.current_profile.game_key != game.key
+        ):
+            old_game = next(
+                (
+                    item
+                    for item in self.games
+                    if item.key == self.current_profile.game_key
+                ),
+                None,
+            )
+            answer = QMessageBox.question(
+                self,
+                "Unsaved profile",
+                f"Save changes to “{self.current_profile.name}”?",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save,
+            )
+            if answer == QMessageBox.Cancel:
+                self.game_combo.blockSignals(True)
+                self.game_combo.setCurrentIndex(
+                    self.game_combo.findData(self.current_profile.game_key)
+                )
+                self.game_combo.blockSignals(False)
+                return
+            if answer == QMessageBox.Save and old_game:
+                self._save_current_profile(old_game)
+        self.store.data["last_game"] = game.key
+        template = LaunchProfile(
+            DEFAULT_PROFILE_ID,
+            "Default",
+            game.key,
+            executable=game.shortcut_exe or game.default_executable,
+            working_directory=game.shortcut_start_dir,
+            overlay_app_id=(
+                "480" if game.source.value == "shortcut" else str(game.app_id)
+            ),
+        )
+        if game.source.value == "shortcut":
+            existing = self.store.data["games"].get(game.key, {})
+            override = str(existing.get("prefix_override", ""))
+            prefix = (
+                Path(override).expanduser() if override else game.default_prefix
+            ).resolve(strict=False)
+            metadata = read_prefix_metadata(prefix, self.protons)
+            if metadata.state == "known" and metadata.proton_root:
+                initialized_proton = next(
+                    (
+                        proton
+                        for proton in self.protons
+                        if proton.root.resolve(strict=False)
+                        == metadata.proton_root.resolve(strict=False)
+                    ),
+                    None,
+                )
+                if initialized_proton:
+                    template.proton_path = str(initialized_proton.launcher)
+                    template.use_default_proton = False
+        self.store.ensure_game(game.key, template)
+        game_data = self.store.game_data(game.key)
+        profiles = self.store.profiles(game.key)
+        profiles.sort(
+            key=lambda item: (item.id != DEFAULT_PROFILE_ID, item.name.casefold())
+        )
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.clear()
+        for profile in profiles:
+            self.profile_combo.addItem(profile.name, profile.id)
+        wanted = game_data.get("last_profile_id", DEFAULT_PROFILE_ID)
+        self.profile_combo.setCurrentIndex(max(0, self.profile_combo.findData(wanted)))
+        self.profile_combo.blockSignals(False)
+        selected = next(
+            (item for item in profiles if item.id == self.profile_combo.currentData()),
+            profiles[0],
+        )
+        self.load_profile(selected)
+        self._update_prefix_badge()
+        self._update_wemod_status()
+
+    def profile_changed(self, *_args) -> None:
+        game = self.current_game()
+        if not game or self.loading_profile:
+            return
+        if (
+            self.autosave_timer.isActive()
+            and self.current_profile
+            and self.current_profile.id == DEFAULT_PROFILE_ID
+        ):
+            self._autosave_default()
+        if (
+            self.named_profile_dirty
+            and self.current_profile
+            and self.current_profile.id != DEFAULT_PROFILE_ID
+        ):
+            answer = QMessageBox.question(
+                self,
+                "Unsaved profile",
+                f"Save changes to “{self.current_profile.name}”?",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save,
+            )
+            if answer == QMessageBox.Cancel:
+                self.profile_combo.blockSignals(True)
+                self.profile_combo.setCurrentIndex(
+                    self.profile_combo.findData(self.current_profile.id)
+                )
+                self.profile_combo.blockSignals(False)
+                return
+            if answer == QMessageBox.Save:
+                self._save_current_profile()
+        profile_id = self.profile_combo.currentData()
+        profile = next(
+            (item for item in self.store.profiles(game.key) if item.id == profile_id),
+            None,
+        )
+        if profile:
+            self.store.game_data(game.key)["last_profile_id"] = profile.id
+            self.store.save()
+            self.load_profile(profile)
+
+    def load_profile(self, profile: LaunchProfile) -> None:
+        self.loading_profile = True
+        self.current_profile = profile
+        self.tabs.setCurrentIndex(0 if profile.mode == "executable" else 1)
+        self.exe_edit.setText(profile.executable)
+        self.command_edit.setText(profile.command)
+        self.arguments_edit.setText(profile.arguments)
+        self.working_edit.setText(profile.working_directory)
+        self.environment_edit.setPlainText(profile.environment_text)
+        self.admin_checkbox.setChecked(profile.run_as_admin)
+        self.steam_launch_checkbox.setChecked(profile.launch_through_steam)
+        self.overlay_checkbox.setChecked(profile.inject_steam_overlay)
+        self.overlay_app_id_edit.setText(profile.overlay_app_id)
+        self.online_fix_checkbox.setChecked(profile.apply_online_fix)
+        self.wemod_checkbox.setChecked(profile.launch_wemod)
+        self.followup_group.setChecked(profile.followup_enabled)
+        self.wait_exe_edit.setText(profile.wait_for_executable)
+        self.wait_primary_checkbox.setChecked(profile.wait_for_primary_executable)
+        self.followup_delay_spin.setValue(profile.followup_delay)
+        self.followup_mode_combo.setCurrentIndex(
+            max(0, self.followup_mode_combo.findData(profile.followup_mode))
+        )
+        self.followup_target_edit.setText(
+            profile.followup_executable
+            if profile.followup_mode == "executable"
+            else profile.followup_command
+        )
+        self.followup_arguments_edit.setText(profile.followup_arguments)
+        self.followup_admin_checkbox.setChecked(profile.followup_run_as_admin)
+        self._populate_proton_combo(profile)
+        self.loading_profile = False
+        self.named_profile_dirty = False
+        self._update_profile_buttons()
+        self._steam_launch_mode_changed()
+        self._followup_mode_changed()
+        self._wemod_mode_changed()
+
+    def _populate_proton_combo(self, profile: LaunchProfile) -> None:
+        self.proton_combo.blockSignals(True)
+        self.proton_combo.clear()
+        default_name = (
+            self.default_proton.display_name if self.default_proton else "Unavailable"
+        )
+        self.proton_combo.addItem(f"Launcher default: {default_name}", "__default__")
+        for proton in self.protons:
+            self.proton_combo.addItem(proton.display_name, str(proton.launcher))
+        wanted = "__default__" if profile.use_default_proton else profile.proton_path
+        self.proton_combo.setCurrentIndex(max(0, self.proton_combo.findData(wanted)))
+        self.proton_combo.blockSignals(False)
+        self._update_proton_tooltip()
+
+    def _profile_from_ui(
+        self,
+        name: str | None = None,
+        new_id: bool = False,
+        game_override: GameEntry | None = None,
+    ) -> LaunchProfile:
+        game = game_override or self.current_game()
+        if not game:
+            raise ValueError("Choose a game")
+        current = self.current_profile
+        followup_mode = str(self.followup_mode_combo.currentData())
+        proton_data = str(self.proton_combo.currentData() or "__default__")
+        return LaunchProfile(
+            id=str(uuid.uuid4()) if new_id or not current else current.id,
+            name=name or (current.name if current else "Profile"),
+            game_key=game.key,
+            proton_path="" if proton_data == "__default__" else proton_data,
+            use_default_proton=proton_data == "__default__",
+            mode="executable" if self.tabs.currentIndex() == 0 else "command",
+            executable=self.exe_edit.text(),
+            command=self.command_edit.text(),
+            arguments=self.arguments_edit.text(),
+            working_directory=self.working_edit.text(),
+            environment_text=self.environment_edit.toPlainText(),
+            run_as_admin=self.admin_checkbox.isChecked(),
+            launch_through_steam=self.steam_launch_checkbox.isChecked(),
+            inject_steam_overlay=self.overlay_checkbox.isChecked(),
+            overlay_app_id=self.overlay_app_id_edit.text().strip(),
+            apply_online_fix=self.online_fix_checkbox.isChecked(),
+            launch_wemod=self.wemod_checkbox.isChecked(),
+            followup_enabled=self.followup_group.isChecked(),
+            wait_for_executable=self.wait_exe_edit.text().strip(),
+            wait_for_primary_executable=self.wait_primary_checkbox.isChecked(),
+            followup_delay=self.followup_delay_spin.value(),
+            followup_mode=followup_mode,
+            followup_executable=(
+                self.followup_target_edit.text()
+                if followup_mode == "executable"
+                else ""
+            ),
+            followup_command=(
+                self.followup_target_edit.text() if followup_mode == "command" else ""
+            ),
+            followup_arguments=self.followup_arguments_edit.text(),
+            followup_run_as_admin=self.followup_admin_checkbox.isChecked(),
+        )
+
+    def _resolved_profile(self, profile: LaunchProfile) -> LaunchProfile:
+        if not profile.use_default_proton:
+            return profile
+        if not self.default_proton:
+            raise ValueError("No default Proton installation is available")
+        return replace(profile, proton_path=str(self.default_proton.launcher))
+
+    def _field_changed(self, *_args) -> None:
+        if self.loading_profile or not self.current_profile:
+            return
+        if self.current_profile.id == DEFAULT_PROFILE_ID:
+            self.autosave_timer.start()
+            self.status.setText("Default profile changed…")
+        else:
+            self.named_profile_dirty = True
+            index = self.profile_combo.currentIndex()
+            if index >= 0 and not self.profile_combo.itemText(index).endswith(" *"):
+                self.profile_combo.setItemText(index, f"{self.current_profile.name} *")
+            self._update_profile_buttons()
+
+    def _autosave_default(self) -> None:
+        if not self.current_profile or self.current_profile.id != DEFAULT_PROFILE_ID:
+            return
+        game = next(
+            (item for item in self.games if item.key == self.current_profile.game_key),
+            None,
+        )
+        if not game:
+            return
+        self.autosave_timer.stop()
+        profile = self._profile_from_ui(name="Default", game_override=game)
+        profile.id = DEFAULT_PROFILE_ID
+        self.store.put_profile(profile)
+        self.current_profile = profile
+        self.status.setText("Default profile saved")
+
+    def new_profile(self) -> None:
+        game = self.current_game()
+        if not game:
+            return
+        name, ok = QInputDialog.getText(self, "New profile", "Name")
+        if not ok or not name.strip():
+            return
+        profile = LaunchProfile(
+            str(uuid.uuid4()),
+            name.strip(),
+            game.key,
+            executable=game.shortcut_exe or game.default_executable,
+            working_directory=game.shortcut_start_dir,
+            overlay_app_id=(
+                "480" if game.source.value == "shortcut" else str(game.app_id)
+            ),
+        )
+        self.store.put_profile(profile)
+        self.game_changed()
+        self.profile_combo.setCurrentIndex(self.profile_combo.findData(profile.id))
+
+    def _save_current_profile(self, game_override: GameEntry | None = None) -> None:
+        profile = self._profile_from_ui(game_override=game_override)
+        self.store.put_profile(profile)
+        self.current_profile = profile
+        self.named_profile_dirty = False
+        index = self.profile_combo.findData(profile.id)
+        if index >= 0:
+            self.profile_combo.setItemText(index, profile.name)
+        self._update_profile_buttons()
+        self.status.setText(f"Saved {profile.name}")
+
+    def save_profile(self) -> None:
+        if not self.current_profile or self.current_profile.id == DEFAULT_PROFILE_ID:
+            self._autosave_default()
+            return
+        self._save_current_profile()
+
+    def duplicate_profile(self) -> None:
+        if not self.current_profile:
+            return
+        name, ok = QInputDialog.getText(
+            self,
+            "Duplicate profile",
+            "New name",
+            text=f"{self.current_profile.name} copy",
+        )
+        if not ok or not name.strip():
+            return
+        profile = self._profile_from_ui(name.strip(), True)
+        self.store.put_profile(profile)
+        self.game_changed()
+        self.profile_combo.setCurrentIndex(self.profile_combo.findData(profile.id))
+
+    def delete_profile(self) -> None:
+        if not self.current_profile or self.current_profile.id == DEFAULT_PROFILE_ID:
+            return
+        if (
+            QMessageBox.question(
+                self, "Delete profile", f"Delete “{self.current_profile.name}”?"
+            )
+            == QMessageBox.Yes
+        ):
+            self.store.delete_profile(self.current_profile)
+            self.game_changed()
+
+    def _update_profile_buttons(self) -> None:
+        is_default = bool(
+            self.current_profile and self.current_profile.id == DEFAULT_PROFILE_ID
+        )
+        self.save_button.setEnabled(not is_default and self.named_profile_dirty)
+        self.delete_button.setEnabled(not is_default)
+
+    def launch(self) -> None:
+        followup_record = None
+        try:
+            game = self.current_game()
+            if not game:
+                raise ValueError("Choose a game")
+            profile = self._resolved_profile(self._profile_from_ui())
+            if profile.launch_through_steam and profile.launch_wemod:
+                raise ValueError(
+                    "Launch with WeMod cannot be combined with Launch through Steam"
+                )
+            if profile.launch_wemod and not self.store.settings["wemod_launcher_path"]:
+                wemod, _ = QFileDialog.getOpenFileName(
+                    self, "Choose WeMod Launcher", str(Path.home())
+                )
+                if not wemod:
+                    raise ValueError("Choose the WeMod Launcher executable")
+                self.store.settings["wemod_launcher_path"] = wemod
+                self.store.save()
+                self._update_wemod_status()
+            prefix = self._prefix_for_game(game)
+            if prepare_compatdata_directory(prefix):
+                self._log(f"Created compatibility-data directory: {prefix}")
+            if profile.followup_enabled:
+                target = (
+                    primary_executable_name(
+                        profile.mode, profile.executable, profile.command
+                    )
+                    if profile.wait_for_primary_executable
+                    else profile.wait_for_executable
+                )
+                if not target:
+                    raise ValueError("Enter the executable name to wait for")
+                followup_spec = build_followup_launch_spec(game, profile, prefix)
+                baseline = find_matching_pids(target, prefix)
+                followup_record = self.sessions.start(
+                    SessionKind.FOLLOWUP,
+                    followup_spec,
+                    game.key,
+                    game.name,
+                    prefix,
+                    watch_target=target,
+                    watch_baseline=baseline,
+                    delay_seconds=profile.followup_delay,
+                )
+                self._register_session(followup_record)
+            spec = (
+                build_steam_launch_spec(game)
+                if profile.launch_through_steam
+                else build_launch_spec(
+                    game,
+                    profile,
+                    prefix,
+                    self.store.settings["wemod_launcher_path"],
+                )
+            )
+            record = self.sessions.start(
+                SessionKind.PRIMARY,
+                spec,
+                game.key,
+                game.name,
+                prefix,
+                steam_managed=profile.launch_through_steam,
+            )
+            self._register_session(record)
+            self._log("$ " + shlex.join([spec.program, *spec.arguments]))
+            self.status.setText(f"Launched {game.name}")
+            self._refresh_sessions()
+            if self.store.settings["auto_hide_after_launch"]:
+                if QSystemTrayIcon.isSystemTrayAvailable():
+                    self.hide()
+                    self.tray.showMessage("Proton Launcher", f"Launched {game.name}")
+                else:
+                    self._log("Auto-hide skipped because no system tray is available")
+        except (ValueError, OSError) as exc:
+            if followup_record:
+                self.sessions.stop(followup_record)
+            QMessageBox.warning(self, "Cannot launch", str(exc))
+            self._log(f"Launch rejected: {exc}")
+
+    def launch_followup_now(self) -> None:
+        try:
+            game = self.current_game()
+            if not game:
+                raise ValueError("Choose a game")
+            profile = self._resolved_profile(self._profile_from_ui())
+            if not profile.followup_enabled:
+                raise ValueError("Enable Follow-up launch first")
+            self.stop_followup()
+            prefix = self._prefix_for_game(game)
+            prepare_compatdata_directory(prefix)
+            spec = build_followup_launch_spec(game, profile, prefix)
+            record = self.sessions.start(
+                SessionKind.FOLLOWUP, spec, game.key, game.name, prefix
+            )
+            self._register_session(record)
+            self._log("Follow-up: $ " + shlex.join([spec.program, *spec.arguments]))
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, "Cannot launch follow-up", str(exc))
+
+    def _register_session(self, record: SessionRecord) -> None:
+        self.session_records[record.id] = record
+        self.log_offsets.setdefault(record.id, 0)
+
+    def _refresh_sessions(self) -> None:
+        active = self.sessions.active()
+        for record in active:
+            self._register_session(record)
+        self._tail_session_logs()
+        self._update_session_buttons(active)
+        if active:
+            labels = [f"{item.kind}: {item.phase}" for item in active]
+            self.status.setText(" • ".join(labels))
+        elif self.session_records:
+            self.status.setText("Sessions finished")
+            self._update_prefix_badge()
+
+    def _tail_session_logs(self) -> None:
+        for record in self.session_records.values():
+            path = Path(record.log_path)
+            try:
+                with path.open("rb") as handle:
+                    offset = self.log_offsets.get(record.id, 0)
+                    handle.seek(offset)
+                    data = handle.read()
+                    self.log_offsets[record.id] = handle.tell()
+                if data:
+                    prefix = (
+                        "[follow-up] "
+                        if record.kind == SessionKind.FOLLOWUP.value
+                        else ""
+                    )
+                    cleaned = clean_process_output(data.decode(errors="replace"))
+                    for line in cleaned.splitlines():
+                        self._log(prefix + line)
+            except OSError:
+                continue
+
+    def _update_session_buttons(self, active: list[SessionRecord]) -> None:
+        primary = any(item.kind == SessionKind.PRIMARY.value for item in active)
+        followup = any(item.kind == SessionKind.FOLLOWUP.value for item in active)
+        self.launch_button.setEnabled(not primary)
+        self.stop_game_button.setEnabled(primary)
+        self.stop_followup_button.setEnabled(followup)
+        self.stop_all_button.setEnabled(primary or followup)
+        (
+            self.tray_stop_game.setEnabled(primary)
+            if hasattr(self, "tray_stop_game")
+            else None
+        )
+        (
+            self.tray_stop_followup.setEnabled(followup)
+            if hasattr(self, "tray_stop_followup")
+            else None
+        )
+        (
+            self.tray_stop_all.setEnabled(primary or followup)
+            if hasattr(self, "tray_stop_all")
+            else None
+        )
+        self.followup_launch_now_button.setEnabled(
+            self.followup_group.isChecked() and not followup
+        )
+
+    def stop_game(self) -> None:
+        primary = self.sessions.records(SessionKind.PRIMARY)
+        followups = self.sessions.records(SessionKind.FOLLOWUP)
+        for record in primary:
+            self.sessions.stop(record)
+        for record in followups:
+            if record.phase in {"starting", "waiting"}:
+                self.sessions.stop(record)
+        self._log("Stop Game requested")
+        self._refresh_sessions()
+
+    def stop_followup(self) -> None:
+        self.sessions.stop_kind(SessionKind.FOLLOWUP)
+        self._log("Stop Follow-up requested")
+        self._refresh_sessions()
+
+    def stop_all(self) -> None:
+        self.sessions.stop_all()
+        self._log("Stop All requested")
+        self._refresh_sessions()
+
+    def _prefix_for_game(self, game: GameEntry) -> Path:
+        override = self.store.prefix_override(game.key)
+        return (
+            Path(override).expanduser() if override else game.default_prefix
+        ).resolve(strict=False)
+
+    def _update_prefix_badge(self) -> None:
+        game = self.current_game()
+        if not game:
+            self.prefix_badge.setText("Prefix: not selected")
+            return
+        prefix = self._prefix_for_game(game)
+        metadata = read_prefix_metadata(prefix, self.protons)
+        self.prefix_badge.setText(metadata.badge)
+        details = [f"Prefix: {prefix}"]
+        if metadata.version:
+            details.append(f"Recorded version: {metadata.version}")
+        if metadata.proton_root:
+            details.append(f"Proton root: {metadata.proton_root}")
+        if self.store.prefix_override(game.key):
+            details.append("Custom prefix override")
+        self.prefix_badge.setToolTip("\n".join(details))
+
+    def open_settings(self, initial_tab: str = "general") -> None:
+        # QAction.triggered supplies a bool; only named callers select a tab.
+        if not isinstance(initial_tab, str):
+            initial_tab = "general"
+        dialog = SettingsDialog(
+            self.store,
+            self.protons,
+            self.steam_default_tool,
+            self.steam_roots,
+            self.libraries,
+            self.sessions.backend_name,
+            self.refresh,
+            self,
+            initial_tab=initial_tab,
+        )
+        dialog.exec()
+        self._update_wemod_status()
+
+    def _update_wemod_status(self) -> None:
+        path = self.store.settings["wemod_launcher_path"]
+        game = self.current_game()
+        initialized = bool(
+            game
+            and (self._prefix_for_game(game) / "pfx" / ".wemod_installer").is_file()
+        )
+        self.delete_wemod_button.setEnabled(initialized)
+        if not path:
+            self.wemod_status.setText("Not configured")
+            return
+        self.wemod_status.setText(f"Using {Path(path).name}")
+        self.wemod_status.setToolTip(path)
+
+    def delete_wemod(self) -> None:
+        game = self.current_game()
+        if not game:
+            return
+        prefix = self._prefix_for_game(game)
+        marker = prefix / "pfx" / ".wemod_installer"
+        if not marker.is_file():
+            QMessageBox.information(
+                self,
+                "WeMod is not initialized",
+                f"There is no WeMod setup to remove from:\n{prefix}",
+            )
+            self._update_wemod_status()
+            return
+
+        answer = QMessageBox.warning(
+            self,
+            "Delete WeMod setup?",
+            f"Remove WeMod setup from the prefix for {game.name}?\n\n"
+            f"{prefix}\n\n"
+            "The game prefix, saves, and shared WeMod login data are kept. "
+            "The next Launch with WeMod will run setup again and may offer to "
+            "copy a compatible initialized prefix.\n\n"
+            "Installed .NET files and registry changes are shared with Wine and "
+            "cannot be removed safely on their own.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        for record in self.sessions.active():
+            if Path(record.prefix).resolve(strict=False) == prefix:
+                self.sessions.stop(record)
+
+        try:
+            removed = reset_wemod_prefix(prefix)
+        except OSError as error:
+            QMessageBox.critical(self, "Could not delete WeMod setup", str(error))
+            self._log(f"WeMod setup deletion failed for {prefix}: {error}")
+            return
+
+        self._log("Removed WeMod setup: " + ", ".join(map(str, removed)))
+        self.status.setText(f"WeMod setup deleted for {game.name}")
+        self._update_wemod_status()
+
+    def set_prefix(self) -> None:
+        game = self.current_game()
+        if not game:
+            return
+        choice = QMessageBox(self)
+        choice.setWindowTitle("Compatibility-data prefix")
+        choice.setText(f"Manage the prefix for {game.name}")
+        choose_button = choice.addButton(
+            "Choose custom prefix…", QMessageBox.AcceptRole
+        )
+        reset_button = choice.addButton("Use default prefix", QMessageBox.ActionRole)
+        choice.addButton(QMessageBox.Cancel)
+        choice.exec()
+        if choice.clickedButton() == reset_button:
+            self.store.set_prefix_override(game.key, "")
+            self._update_prefix_badge()
+            return
+        if choice.clickedButton() != choose_button:
+            return
+        current = self.store.prefix_override(game.key) or str(game.default_prefix)
+        path = QFileDialog.getExistingDirectory(
+            self, "Choose compatibility-data prefix", current
+        )
+        if path:
+            self.store.set_prefix_override(game.key, path)
+            self._update_prefix_badge()
+
+    def delete_prefix(self) -> None:
+        game = self.current_game()
+        if not game:
+            return
+        prefix = self._prefix_for_game(game)
+        if not prefix.exists():
+            QMessageBox.information(
+                self,
+                "Prefix does not exist",
+                f"There is no prefix to delete at:\n{prefix}",
+            )
+            return
+
+        protected = {
+            Path.home().resolve(strict=False),
+            game.steam_root.resolve(strict=False),
+            game.library_root.resolve(strict=False),
+        }
+        if game.install_dir:
+            protected.add(game.install_dir.resolve(strict=False))
+        if prefix == Path("/") or prefix in protected or len(prefix.parts) < 4:
+            QMessageBox.critical(
+                self,
+                "Unsafe prefix path",
+                f"Refusing to delete a protected or overly broad path:\n{prefix}",
+            )
+            return
+
+        answer = QMessageBox.warning(
+            self,
+            "Delete compatibility prefix?",
+            f"Delete the entire compatibility prefix for {game.name}?\n\n"
+            f"{prefix}\n\n"
+            "This removes the Wine prefix, installed dependencies, settings, "
+            "and any game saves stored inside it. Cloud or externally stored "
+            "saves are not affected. Running sessions for this prefix will be "
+            "stopped first.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        for record in self.sessions.active():
+            if Path(record.prefix).resolve(strict=False) == prefix:
+                self.sessions.stop(record)
+
+        try:
+            gio = shutil.which("gio")
+            if gio:
+                result = subprocess.run(
+                    [gio, "trash", str(prefix)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=30,
+                )
+                if result.returncode:
+                    raise OSError(result.stderr.strip() or "gio trash failed")
+                destination = "Trash"
+            else:
+                shutil.rmtree(prefix)
+                destination = "permanently"
+        except (OSError, subprocess.TimeoutExpired) as error:
+            QMessageBox.critical(self, "Could not delete prefix", str(error))
+            self._log(f"Prefix deletion failed for {prefix}: {error}")
+            return
+
+        self._log(f"Deleted prefix {prefix} ({destination})")
+        self.status.setText(f"Prefix deleted for {game.name}")
+        self._update_prefix_badge()
+
+    def open_prefix(self) -> None:
+        game = self.current_game()
+        if not game:
+            return
+        prefix = self._prefix_for_game(game)
+        if not prefix.is_dir():
+            QMessageBox.information(
+                self,
+                "Prefix does not exist",
+                f"There is no prefix folder to open at:\n{prefix}",
+            )
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(prefix))):
+            QMessageBox.warning(
+                self,
+                "Could not open prefix",
+                f"The desktop file manager could not open:\n{prefix}",
+            )
+
+    def browse_executable(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose Windows executable",
+            self.exe_edit.text() or str(Path.home()),
+            "Windows executables (*.exe);;All files (*)",
+        )
+        if path:
+            self.exe_edit.setText(path)
+
+    def browse_working(self) -> None:
+        path = QFileDialog.getExistingDirectory(
+            self,
+            "Choose working directory",
+            self.working_edit.text() or str(Path.home()),
+        )
+        if path:
+            self.working_edit.setText(path)
+
+    def browse_followup(self) -> None:
+        if self.followup_mode_combo.currentData() != "executable":
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose follow-up executable",
+            self.followup_target_edit.text() or str(Path.home()),
+            "Windows executables (*.exe);;All files (*)",
+        )
+        if path:
+            self.followup_target_edit.setText(path)
+
+    def _online_fix_toggled(self, checked: bool) -> None:
+        if self.loading_profile:
+            return
+        if checked and not self.overlay_checkbox.isChecked():
+            self.overlay_checkbox.setChecked(True)
+
+    def _steam_launch_mode_changed(self, *_args) -> None:
+        direct = not self.steam_launch_checkbox.isChecked()
+        self.overlay_checkbox.setEnabled(direct)
+        self._overlay_mode_changed()
+        self._wemod_mode_changed()
+
+    def _overlay_mode_changed(self, *_args) -> None:
+        self.overlay_app_id_edit.setEnabled(
+            self.overlay_checkbox.isChecked()
+            and not self.steam_launch_checkbox.isChecked()
+        )
+
+    def _wemod_mode_changed(self, *_args) -> None:
+        if not hasattr(self, "wemod_checkbox"):
+            return
+        compatible = (
+            self.tabs.currentIndex() == 0 and not self.steam_launch_checkbox.isChecked()
+        )
+        self.wemod_checkbox.setEnabled(compatible)
+
+    def _mode_changed(self, *_args) -> None:
+        self._update_wait_target()
+        self._wemod_mode_changed()
+
+    def _followup_mode_changed(self, *_args) -> None:
+        executable = self.followup_mode_combo.currentData() == "executable"
+        self.followup_browse_button.setEnabled(executable)
+        self.followup_admin_checkbox.setEnabled(executable)
+        self.followup_target_edit.setPlaceholderText(
+            "/path/to/tool.exe" if executable else "wine explorer ."
+        )
+
+    def _update_wait_target(self, *_args) -> None:
+        if not hasattr(self, "wait_primary_checkbox"):
+            return
+        automatic = self.wait_primary_checkbox.isChecked()
+        self.wait_exe_edit.setEnabled(not automatic)
+        if automatic:
+            mode = "executable" if self.tabs.currentIndex() == 0 else "command"
+            try:
+                target = primary_executable_name(
+                    mode, self.exe_edit.text(), self.command_edit.text()
+                )
+            except ValueError:
+                target = ""
+            self.wait_exe_edit.setText(target)
+
+    def _update_proton_tooltip(self, *_args) -> None:
+        data = str(self.proton_combo.currentData() or "")
+        if data == "__default__" and self.default_proton:
+            data = str(self.default_proton.launcher)
+        self.proton_combo.setToolTip(data)
+
+    def copy_steam_launch_options(self) -> None:
+        try:
+            profile = self._profile_from_ui()
+            environment = parse_environment_text(profile.environment_text)
+            if profile.apply_online_fix:
+                from .models import DEFAULT_NON_STEAM_WINEDLLOVERRIDES
+
+                environment["WINEDLLOVERRIDES"] = DEFAULT_NON_STEAM_WINEDLLOVERRIDES
+            assignments = [
+                f"{name}={shlex.quote(value)}" for name, value in environment.items()
+            ]
+            arguments = shlex.split(profile.arguments)
+            result = " ".join(
+                [*assignments, "%command%", *(shlex.quote(item) for item in arguments)]
+            )
+            QApplication.clipboard().setText(result)
+            self.status.setText("Steam Launch Options copied")
+        except ValueError as exc:
+            QMessageBox.warning(self, "Cannot generate Steam Launch Options", str(exc))
+
+    def _log(self, text: str) -> None:
+        self.log.appendPlainText(text)
+
+    def _show_from_tray(self) -> None:
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit_from_menu(self) -> None:
+        self.close()
+
+    def _quit_keep_sessions(self) -> None:
+        self._force_quit = True
+        QApplication.quit()
+
+    def _stop_and_quit(self) -> None:
+        self.sessions.stop_all()
+        self._force_quit = True
+        QApplication.quit()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if self.autosave_timer.isActive():
+            self._autosave_default()
+        if self._force_quit:
+            event.accept()
+            return
+        active = self.sessions.active()
+        if not active:
+            event.accept()
+            QTimer.singleShot(0, QApplication.quit)
+            return
+        behavior = self.store.settings["close_behavior"]
+        if behavior == "ask":
+            box = QMessageBox(self)
+            box.setWindowTitle("Sessions are still running")
+            box.setText("What should Proton Launcher do with the running sessions?")
+            hide_button = box.addButton("Hide to tray", QMessageBox.AcceptRole)
+            keep_button = box.addButton(
+                "Exit and keep running", QMessageBox.DestructiveRole
+            )
+            box.addButton("Stop all and exit", QMessageBox.DestructiveRole)
+            cancel_button = box.addButton(QMessageBox.Cancel)
+            remember = QCheckBox("Remember my choice")
+            box.setCheckBox(remember)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked == cancel_button:
+                event.ignore()
+                return
+            behavior = (
+                "tray"
+                if clicked == hide_button
+                else "keep-running" if clicked == keep_button else "stop-and-exit"
+            )
+            if remember.isChecked():
+                self.store.settings["close_behavior"] = behavior
+                self.store.save()
+        if behavior == "tray":
+            if not QSystemTrayIcon.isSystemTrayAvailable():
+                QMessageBox.warning(
+                    self,
+                    "System tray unavailable",
+                    "The window cannot be hidden because no system tray is available.",
+                )
+                event.ignore()
+                return
+            self.hide()
+            event.ignore()
+            return
+        if behavior == "stop-and-exit":
+            self.sessions.stop_all()
+        event.accept()
+        self._force_quit = True
+        QTimer.singleShot(0, QApplication.quit)

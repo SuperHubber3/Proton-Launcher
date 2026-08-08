@@ -1,0 +1,10 @@
+#!/usr/bin/env xdg-open
+# SPDX-License-Identifier: GPL-3.0-only
+[Desktop Entry]
+Type=Application
+Name=Proton Launcher
+Comment=Run executables and Wine commands in Steam Proton prefixes
+Exec="@EXEC@"
+Icon=@ICON@
+Terminal=false
+Categories=Game;
