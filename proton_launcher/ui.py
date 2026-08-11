@@ -16,6 +16,7 @@ from PySide6.QtGui import (
     QFontDatabase,
     QIcon,
 )
+from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -50,10 +51,12 @@ from .proton import (
     read_prefix_metadata,
     resolve_proton_choice,
 )
+from .protondb import game_url, parse_rating, protondb_app_id, summary_url
 from .runner import (
     build_followup_launch_spec,
     build_launch_spec,
     build_steam_launch_spec,
+    build_wemod_launch_spec,
     clean_process_output,
     parse_environment_text,
     prepare_compatdata_directory,
@@ -88,7 +91,12 @@ class MainWindow(QMainWindow):
         self.named_profile_dirty = False
         self.session_records: dict[str, SessionRecord] = {}
         self.log_offsets: dict[str, int] = {}
+        self.protondb_cache: dict[int, str | None] = {}
+        self.protondb_pending: set[int] = set()
+        self.current_protondb_app_id: int | None = None
         self._force_quit = False
+
+        self.protondb_network = QNetworkAccessManager(self)
 
         self.autosave_timer = QTimer(self)
         self.autosave_timer.setSingleShot(True)
@@ -151,6 +159,10 @@ class MainWindow(QMainWindow):
         self.game_combo.currentIndexChanged.connect(self.game_changed)
         game_row = QHBoxLayout()
         game_row.addWidget(self.game_combo, 1)
+        self.protondb_button = QPushButton("ProtonDB")
+        self.protondb_button.setEnabled(False)
+        self.protondb_button.clicked.connect(self.open_protondb)
+        game_row.addWidget(self.protondb_button)
         self.prefix_badge = QLabel("Prefix: not selected")
         self.prefix_badge.setStyleSheet(
             "padding: 3px 7px; border: 1px solid palette(mid); border-radius: 5px;"
@@ -268,6 +280,9 @@ class MainWindow(QMainWindow):
             lambda _checked=False: self.open_settings("integrations")
         )
         wemod_row.addWidget(configure_wemod)
+        self.launch_wemod_button = QPushButton("Launch WeMod")
+        self.launch_wemod_button.clicked.connect(self.launch_wemod)
+        wemod_row.addWidget(self.launch_wemod_button)
         self.delete_wemod_button = QPushButton("Delete WeMod…")
         self.delete_wemod_button.clicked.connect(self.delete_wemod)
         wemod_row.addWidget(self.delete_wemod_button)
@@ -477,11 +492,77 @@ class MainWindow(QMainWindow):
         key = self.game_combo.currentData()
         return next((game for game in self.games if game.key == key), None)
 
+    def _update_protondb_rating(self, game: GameEntry | None) -> None:
+        app_id = protondb_app_id(game) if game else None
+        self.current_protondb_app_id = app_id
+        if not app_id:
+            self.protondb_button.setText("ProtonDB")
+            tooltip = (
+                "No Steam App ID was found for this non-Steam game."
+                if game
+                else "Select a game to view its ProtonDB rating."
+            )
+            self.protondb_button.setToolTip(tooltip)
+            self.protondb_button.setEnabled(False)
+            return
+
+        self.protondb_button.setEnabled(True)
+        rating = self.protondb_cache.get(app_id)
+        if app_id in self.protondb_cache:
+            self.protondb_button.setText(f"ProtonDB: {rating or 'Unrated'}")
+            self.protondb_button.setToolTip("Click to open this game's ProtonDB page.")
+            return
+
+        self.protondb_button.setText("ProtonDB: Loading…")
+        self.protondb_button.setToolTip(
+            "Loading the ProtonDB rating. Click to open the game page."
+        )
+        if app_id in self.protondb_pending:
+            return
+        self.protondb_pending.add(app_id)
+        request = QNetworkRequest(QUrl(summary_url(app_id)))
+        request.setTransferTimeout(10_000)
+        request.setHeader(QNetworkRequest.UserAgentHeader, "Proton Launcher/1.0")
+        reply = self.protondb_network.get(request)
+        reply.finished.connect(
+            lambda app_id=app_id, current_reply=reply: self._protondb_finished(
+                app_id, current_reply
+            )
+        )
+
+    def _protondb_finished(self, app_id: int, reply: QNetworkReply) -> None:
+        self.protondb_pending.discard(app_id)
+        error = reply.error()
+        status = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
+        if error == QNetworkReply.NoError:
+            self.protondb_cache[app_id] = parse_rating(bytes(reply.readAll()))
+        elif status == 404:
+            self.protondb_cache[app_id] = None
+        reply.deleteLater()
+
+        game = self.current_game()
+        if not game or self.current_protondb_app_id != app_id:
+            return
+        if error != QNetworkReply.NoError and status != 404:
+            self.protondb_button.setText("ProtonDB: Offline")
+            self.protondb_button.setToolTip(
+                "The rating could not be loaded. Click to open the game page."
+            )
+            return
+        self._update_protondb_rating(game)
+
+    def open_protondb(self) -> None:
+        if not self.current_game() or not self.current_protondb_app_id:
+            return
+        if not QDesktopServices.openUrl(QUrl(game_url(self.current_protondb_app_id))):
+            self.status.setText("Could not open the ProtonDB page")
+
     def game_changed(self, *_args) -> None:
         if self.autosave_timer.isActive() and self.current_profile:
             self._autosave_default()
         game = self.current_game()
         if not game:
+            self._update_protondb_rating(None)
             self._update_wemod_status()
             return
         if (
@@ -514,6 +595,7 @@ class MainWindow(QMainWindow):
             if answer == QMessageBox.Save and old_game:
                 self._save_current_profile(old_game)
         self.store.data["last_game"] = game.key
+        self._update_protondb_rating(game)
         template = LaunchProfile(
             DEFAULT_PROFILE_ID,
             "Default",
@@ -913,6 +995,34 @@ class MainWindow(QMainWindow):
         except (ValueError, OSError) as exc:
             QMessageBox.warning(self, "Cannot launch follow-up", str(exc))
 
+    def launch_wemod(self) -> None:
+        try:
+            game = self.current_game()
+            if not game:
+                raise ValueError("Choose a game")
+            wemod_path = self.store.settings["wemod_launcher_path"]
+            if not wemod_path:
+                raise ValueError("Configure the WeMod Launcher path first")
+            profile = self._resolved_profile(self._profile_from_ui())
+            prefix = self._prefix_for_game(game)
+            if prepare_compatdata_directory(prefix):
+                self._log(f"Created compatibility-data directory: {prefix}")
+            spec = build_wemod_launch_spec(game, profile, wemod_path, prefix)
+            record = self.sessions.start(
+                SessionKind.WEMOD,
+                spec,
+                game.key,
+                game.name,
+                prefix,
+            )
+            self._register_session(record)
+            self._log("WeMod: $ " + shlex.join([spec.program, *spec.arguments]))
+            self.status.setText(f"Launched WeMod for {game.name}")
+            self._refresh_sessions()
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, "Cannot launch WeMod", str(exc))
+            self._log(f"WeMod launch rejected: {exc}")
+
     def _register_session(self, record: SessionRecord) -> None:
         self.session_records[record.id] = record
         self.log_offsets.setdefault(record.id, 0)
@@ -940,11 +1050,10 @@ class MainWindow(QMainWindow):
                     data = handle.read()
                     self.log_offsets[record.id] = handle.tell()
                 if data:
-                    prefix = (
-                        "[follow-up] "
-                        if record.kind == SessionKind.FOLLOWUP.value
-                        else ""
-                    )
+                    prefix = {
+                        SessionKind.FOLLOWUP.value: "[follow-up] ",
+                        SessionKind.WEMOD.value: "[wemod] ",
+                    }.get(record.kind, "")
                     cleaned = clean_process_output(data.decode(errors="replace"))
                     for line in cleaned.splitlines():
                         self._log(prefix + line)
@@ -954,10 +1063,12 @@ class MainWindow(QMainWindow):
     def _update_session_buttons(self, active: list[SessionRecord]) -> None:
         primary = any(item.kind == SessionKind.PRIMARY.value for item in active)
         followup = any(item.kind == SessionKind.FOLLOWUP.value for item in active)
+        wemod = any(item.kind == SessionKind.WEMOD.value for item in active)
         self.launch_button.setEnabled(not primary)
+        self.launch_wemod_button.setEnabled(self._wemod_is_configured() and not wemod)
         self.stop_game_button.setEnabled(primary)
         self.stop_followup_button.setEnabled(followup)
-        self.stop_all_button.setEnabled(primary or followup)
+        self.stop_all_button.setEnabled(primary or followup or wemod)
         (
             self.tray_stop_game.setEnabled(primary)
             if hasattr(self, "tray_stop_game")
@@ -969,7 +1080,7 @@ class MainWindow(QMainWindow):
             else None
         )
         (
-            self.tray_stop_all.setEnabled(primary or followup)
+            self.tray_stop_all.setEnabled(primary or followup or wemod)
             if hasattr(self, "tray_stop_all")
             else None
         )
@@ -1047,11 +1158,16 @@ class MainWindow(QMainWindow):
             and (self._prefix_for_game(game) / "pfx" / ".wemod_installer").is_file()
         )
         self.delete_wemod_button.setEnabled(initialized)
+        self.launch_wemod_button.setEnabled(self._wemod_is_configured())
         if not path:
             self.wemod_status.setText("Not configured")
             return
         self.wemod_status.setText(f"Using {Path(path).name}")
         self.wemod_status.setToolTip(path)
+
+    def _wemod_is_configured(self) -> bool:
+        path = self.store.settings["wemod_launcher_path"]
+        return bool(self.current_game() and path and Path(path).expanduser().is_file())
 
     def delete_wemod(self) -> None:
         game = self.current_game()

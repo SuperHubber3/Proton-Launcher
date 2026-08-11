@@ -109,8 +109,63 @@ class UiTests(unittest.TestCase):
             self.window.online_fix_checkbox.text(), "Apply online-fix overrides"
         )
         self.assertEqual(self.window.wemod_checkbox.text(), "Launch with WeMod")
+        self.assertEqual(self.window.launch_wemod_button.text(), "Launch WeMod")
         self.assertEqual(self.window.profile_combo.itemText(0), "Default")
         self.assertFalse(self.window.delete_button.isEnabled())
+        self.assertEqual(self.window.protondb_button.text(), "ProtonDB")
+        self.assertFalse(self.window.protondb_button.isEnabled())
+
+    def test_protondb_button_shows_rating_and_opens_game_page(self):
+        old_game = self.window.current_game()
+        game = GameEntry(
+            GameSource.STEAM,
+            1593500,
+            "God of War",
+            old_game.steam_root,
+            old_game.library_root,
+            old_game.install_dir,
+            default_executable=old_game.shortcut_exe,
+        )
+        self.window.protondb_cache[game.app_id] = "Gold"
+        self.window.games = [game]
+        self.window.game_combo.blockSignals(True)
+        self.window.game_combo.clear()
+        self.window.game_combo.addItem(game.label, game.key)
+        self.window.game_combo.blockSignals(False)
+        self.window.game_combo.setCurrentIndex(0)
+        self.window.game_changed()
+
+        self.assertEqual(self.window.protondb_button.text(), "ProtonDB: Gold")
+        self.assertTrue(self.window.protondb_button.isEnabled())
+        with patch(
+            "proton_launcher.ui.QDesktopServices.openUrl", return_value=True
+        ) as open_url:
+            self.window.protondb_button.click()
+        self.assertEqual(
+            open_url.call_args.args[0].toString(),
+            "https://www.protondb.com/app/1593500",
+        )
+
+    def test_non_steam_protondb_button_uses_online_fix_real_app_id(self):
+        game = self.window.current_game()
+        executable = Path(game.shortcut_exe)
+        (executable.parent / "OnlineFix.ini").write_text(
+            "[Main]\nRealAppId=3844970\nFakeAppId=480\n"
+        )
+        self.window.protondb_cache[3844970] = "Platinum"
+
+        self.window.game_changed()
+
+        self.assertEqual(self.window.protondb_button.text(), "ProtonDB: Platinum")
+        self.assertTrue(self.window.protondb_button.isEnabled())
+        with patch(
+            "proton_launcher.ui.QDesktopServices.openUrl", return_value=True
+        ) as open_url:
+            self.window.protondb_button.click()
+        self.assertEqual(
+            open_url.call_args.args[0].toString(),
+            "https://www.protondb.com/app/3844970",
+        )
 
     def test_online_fix_enables_but_does_not_lock_overlay(self):
         self.window.overlay_checkbox.setChecked(False)
@@ -152,6 +207,32 @@ class UiTests(unittest.TestCase):
         with patch("proton_launcher.ui.SettingsDialog") as dialog:
             configure.click()
         self.assertEqual(dialog.call_args.kwargs["initial_tab"], "integrations")
+
+    def test_launch_wemod_uses_selected_game_prefix(self):
+        wemod_root = self.tmp / "wemod-launcher"
+        launcher = wemod_root / "src" / "wemod.py"
+        launcher.parent.mkdir(parents=True)
+        launcher.touch()
+        executable = wemod_root / "wemod_data" / "wemod_bin" / "WeMod.exe"
+        executable.parent.mkdir(parents=True)
+        executable.touch()
+        self.window.store.settings["wemod_launcher_path"] = str(launcher)
+        self.window._update_wemod_status()
+        self.assertTrue(self.window.launch_wemod_button.isEnabled())
+
+        with (
+            patch.object(self.window.sessions, "start") as start,
+            patch.object(self.window, "_register_session"),
+            patch.object(self.window, "_refresh_sessions"),
+        ):
+            self.window.launch_wemod()
+
+        kind, spec, game_key, game_name, prefix = start.call_args.args
+        self.assertEqual(kind.value, "wemod")
+        self.assertEqual(game_key, self.window.current_game().key)
+        self.assertEqual(game_name, self.window.current_game().name)
+        self.assertEqual(prefix, self.window.current_game().default_prefix)
+        self.assertEqual(spec.arguments[-1], "--wemod-only")
 
     def test_delete_wemod_requires_confirmation_and_keeps_prefix(self):
         prefix = self.window.current_game().default_prefix
