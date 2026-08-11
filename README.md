@@ -14,6 +14,8 @@ Steam overlay, or launch a second program after the game starts.
 - Finds Steam games in every detected library and filters runtimes,
   redistributables, and Proton packages from the list.
 - Reads non-Steam shortcuts from each Steam user's `shortcuts.vdf`.
+- Shows ProtonDB ratings for Steam games and non-Steam shortcuts with a local
+  Steam App ID.
 - Finds Steam-managed, community, and system Proton installations, including
   tools under `steamapps/common`.
 - Uses the Proton recorded in an existing non-Steam prefix when possible.
@@ -153,15 +155,38 @@ enable **Launch with WeMod** in a profile. Proton Launcher prepares an empty
 prefix with the selected Proton build when needed, starts WeMod, waits for its
 Electron renderer, and starts the game in the same prefix.
 
+**Launch WeMod** opens WeMod by itself in the selected game's prefix. The same
+button also prepares an uninitialized prefix before opening WeMod.
+
+For Steam games, Proton Launcher registers the selected library's real Wine
+path so WeMod sees the same executable path as the running game. A managed
+`Steam.exe` retry helper in that library lets WeMod relaunch the game after a
+crash. It uses the profile's executable, arguments, working directory, and game
+DLL overrides without asking the native Steam client to start an App ID that it
+still considers active. Proton Launcher refuses to replace an unmanaged
+`Steam.exe`; managed files are identified by `.proton-launcher-steam-retry`.
+
+For a non-Steam game, find the title in WeMod and select the game's executable
+once. Proton Launcher reads that saved association after the game closes. On
+later launches, WeMod opens the matching title and edition automatically.
+Proton Launcher keeps the learned IDs in
+`~/.config/proton-launcher/wemod-games.json`; it does not write to WeMod's
+Chromium database.
+
 During setup, wemod-launcher can offer to copy a compatible setup from another
 initialized prefix in the same `compatdata` directory. **Delete WeMod** removes
 the selected prefix's WeMod marker and local data link so setup runs again. It
-keeps the game prefix, saves, shared login data, and WeMod installation. .NET
-files and registry changes remain because they cannot be separated safely from
-the Wine prefix.
+also removes Proton Launcher's managed retry helper from the selected Steam
+library. The game prefix, saves, shared login data, and WeMod installation are
+kept. .NET files and registry changes remain because they cannot be separated
+safely from the Wine prefix.
 
 The game and WeMod use separate environments. Steam overlay preload variables
 are kept out of WeMod's Electron process so they cannot block its window.
+
+If an embedded WeMod map freezes or turns the window black, use **Settings >
+Integrations > Open maps in browser**. The reversible patch sends the same map
+to the system browser and keeps a backup for **Restore in-app maps**.
 
 The configured wemod-launcher installation must contain `WeMod.exe`. Its setup
 prompts may appear the first time a prefix is prepared. WeMod can be used only
@@ -238,11 +263,14 @@ python3 -m pip install -r requirements-dev.txt
 black proton_launcher tests
 ruff check proton_launcher tests
 python3 -m unittest discover -v
-bash -n run.sh build-helper.sh install-desktop-entry.sh
+bash -n run.sh build-helper.sh build-steam-helper.sh install-desktop-entry.sh
 ```
 
 GitHub Actions checks formatting, lint, shell syntax, and tests on Python 3.10
 and 3.13.
+
+After changing `helpers/steam-retry-helper.c`, rebuild the bundled PE with
+`./build-steam-helper.sh`. It requires Clang, LLD, and Wine development files.
 
 ## License
 

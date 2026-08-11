@@ -21,6 +21,7 @@ from .models import LaunchSpec
 class SessionKind(str, Enum):
     PRIMARY = "primary"
     FOLLOWUP = "followup"
+    WEMOD = "wemod"
 
 
 @dataclass(slots=True)

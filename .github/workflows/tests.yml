@@ -47,4 +47,6 @@ jobs:
         run: python -m unittest discover -v
 
       - name: Check shell syntax
-        run: bash -n run.sh build-helper.sh install-desktop-entry.sh
+        run: >-
+          bash -n run.sh build-helper.sh build-steam-helper.sh
+          install-desktop-entry.sh

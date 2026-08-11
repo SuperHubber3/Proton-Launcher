@@ -253,7 +253,14 @@ def discover_games(
             launch_executables = parse_appinfo_launches(
                 root / "appcache" / "appinfo.vdf", app_ids
             )
-        except (OSError, ValueError, struct.error, SyntaxError, IndexError) as exc:
+        except (
+            OSError,
+            ValueError,
+            TypeError,
+            struct.error,
+            SyntaxError,
+            IndexError,
+        ) as exc:
             launch_executables = {}
             issues.append(
                 DiscoveryIssue(

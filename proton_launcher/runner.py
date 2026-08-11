@@ -24,7 +24,23 @@ RUNAS_HELPER = (
     Path(__file__).resolve().parent.parent / "helpers" / "runas-helper.exe.so"
 )
 WEMOD_OVERRIDES_VARIABLE = "PL_WEMOD_WINEDLLOVERRIDES"
+WEMOD_STEAM_LIBRARY_VARIABLE = "PL_WEMOD_STEAM_LIBRARY"
+WEMOD_STEAM_APP_ID_VARIABLE = "PL_WEMOD_STEAM_APP_ID"
 WEMOD_BRIDGE = Path(__file__).resolve().parent / "wemod_bridge.py"
+SYSTEM_DATA_DIRS = ("/usr/local/share", "/usr/share")
+
+
+def process_environment() -> dict[str, str]:
+    """Copy the environment and keep system data files discoverable."""
+    environment = dict(os.environ)
+    data_dirs = [
+        value for value in environment.get("XDG_DATA_DIRS", "").split(":") if value
+    ]
+    for directory in SYSTEM_DATA_DIRS:
+        if directory not in data_dirs:
+            data_dirs.append(directory)
+    environment["XDG_DATA_DIRS"] = ":".join(data_dirs)
+    return environment
 
 
 def clean_process_output(text: str) -> str:
@@ -185,7 +201,7 @@ def build_launch_spec(
         arguments = ["runinprefix"]
         arguments.extend(command)
         arguments.extend(shlex.split(profile.arguments))
-    environment = dict(os.environ)
+    environment = process_environment()
     for name, value in parse_environment_text(profile.environment_text).items():
         if name not in {"STEAM_COMPAT_DATA_PATH", "STEAM_COMPAT_CLIENT_INSTALL_PATH"}:
             environment[name] = value
@@ -232,6 +248,9 @@ def build_launch_spec(
         game_overrides = environment.get("WINEDLLOVERRIDES", "")
         wemod_executable = resolve_wemod_executable(wemod)
         environment[WEMOD_OVERRIDES_VARIABLE] = DEFAULT_WEMOD_WINEDLLOVERRIDES
+        if game.source.value == "steam":
+            environment[WEMOD_STEAM_LIBRARY_VARIABLE] = str(game.library_root)
+            environment[WEMOD_STEAM_APP_ID_VARIABLE] = str(game.app_id)
         if game_overrides:
             environment["WINEDLLOVERRIDES"] = game_overrides
         else:
@@ -272,6 +291,45 @@ def build_followup_launch_spec(
     return build_launch_spec(game, followup, prefix)
 
 
+def build_wemod_launch_spec(
+    game: GameEntry,
+    profile: LaunchProfile,
+    wemod_path: str,
+    prefix: Path | None = None,
+) -> LaunchSpec:
+    """Build a standalone WeMod launch in the selected game's prefix."""
+    proton = expanded_path(profile.proton_path)
+    if not proton.is_file():
+        raise ValueError(f"Proton launcher does not exist: {proton}")
+    wemod = expanded_path(wemod_path)
+    if not wemod.is_file():
+        raise ValueError(f"WeMod launcher does not exist: {wemod}")
+
+    prefix_path = prefix or game.default_prefix
+    wemod_executable = resolve_wemod_executable(wemod)
+    environment = process_environment()
+    environment["STEAM_COMPAT_DATA_PATH"] = str(prefix_path)
+    environment["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = str(game.steam_root)
+    environment["STEAM_COMPAT_TOOL_PATHS"] = str(proton.parent)
+    environment[WEMOD_OVERRIDES_VARIABLE] = DEFAULT_WEMOD_WINEDLLOVERRIDES
+    if game.source.value == "steam":
+        environment[WEMOD_STEAM_LIBRARY_VARIABLE] = str(game.library_root)
+        environment[WEMOD_STEAM_APP_ID_VARIABLE] = str(game.app_id)
+
+    return LaunchSpec(
+        sys.executable,
+        [
+            str(WEMOD_BRIDGE),
+            str(proton),
+            str(wemod_executable),
+            "[]",
+            "--wemod-only",
+        ],
+        environment,
+        str(Path.home()),
+    )
+
+
 def build_steam_launch_spec(game: GameEntry) -> LaunchSpec:
     """Ask the Steam client to launch a registered Steam or shortcut app."""
     program = shutil.which("steam")
@@ -292,4 +350,4 @@ def build_steam_launch_spec(game: GameEntry) -> LaunchSpec:
         arguments = [f"steam://rungameid/{game_id}"]
     else:
         arguments = ["-applaunch", str(game.app_id)]
-    return LaunchSpec(program, arguments, dict(os.environ), str(working))
+    return LaunchSpec(program, arguments, process_environment(), str(working))

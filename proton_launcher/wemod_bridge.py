@@ -6,18 +6,71 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 
+try:
+    from .wemod_state import (
+        WeModGameMapping,
+        discover_custom_mapping,
+        load_cached_mapping,
+        save_cached_mapping,
+    )
+except ImportError:  # Direct execution by runner.py.
+    from wemod_state import (  # type: ignore[no-redef]
+        WeModGameMapping,
+        discover_custom_mapping,
+        load_cached_mapping,
+        save_cached_mapping,
+    )
+
 WEMOD_VARIABLE = "PL_WEMOD_WINEDLLOVERRIDES"
+STEAM_LIBRARY_VARIABLE = "PL_WEMOD_STEAM_LIBRARY"
+STEAM_APP_ID_VARIABLE = "PL_WEMOD_STEAM_APP_ID"
+STEAM_RETRY_HELPER = (
+    Path(__file__).resolve().parent.parent / "helpers" / "steam-retry-helper.exe"
+)
+STEAM_RETRY_MARKER = ".proton-launcher-steam-retry"
+# Proton forces its built-in steam.exe for every title except Locoland. Use
+# that exception while WeMod starts the retry helper, then let the helper set
+# the selected game's real Steam IDs before it creates the game process.
+STEAM_RETRY_NATIVE_APP_ID = "352130"
+STEAM_RETRY_NATIVE_OVERRIDE = "steam.exe=n,b"
+# Keep Electron diagnostics available without forcing a graphics backend.
+WEMOD_RENDER_ARGUMENTS = ("--enable-logging=file",)
 WEMOD_READY_TIMEOUT = 45.0
 WEMOD_READY_SETTLE_TIME = 2.0
+REGISTRY_TIMEOUT = 30.0
 
 
-def reset_wemod_prefix(prefix: Path) -> list[Path]:
-    """Remove WeMod's prefix marker and its prefix-local data link."""
+def _legacy_steam_retry_directory(pfx: Path) -> Path:
+    return pfx / "drive_c" / "ProtonLauncher" / "Steam"
+
+
+def _steam_retry_paths(library: Path) -> tuple[Path, Path]:
+    return library / "Steam.exe", library / STEAM_RETRY_MARKER
+
+
+def _remove_steam_retry_helper(library: Path) -> list[Path]:
+    destination, marker = _steam_retry_paths(library.resolve(strict=False))
+    if not marker.is_file():
+        return []
+    if destination.exists() and not destination.is_file():
+        raise OSError(f"Refusing to remove a non-file path: {destination}")
+    removed = []
+    if destination.is_file():
+        destination.unlink()
+        removed.append(destination)
+    marker.unlink()
+    removed.append(marker)
+    return removed
+
+
+def reset_wemod_prefix(prefix: Path, steam_library: Path | None = None) -> list[Path]:
+    """Remove launcher-managed WeMod setup files."""
     pfx = prefix.resolve(strict=False) / "pfx"
     candidates = (
         pfx / ".wemod_installer",
@@ -28,7 +81,205 @@ def reset_wemod_prefix(prefix: Path) -> list[Path]:
         if path.is_symlink() or (path == candidates[0] and path.is_file()):
             path.unlink()
             removed.append(path)
+    retry_root = _legacy_steam_retry_directory(pfx)
+    if retry_root.is_symlink():
+        retry_root.unlink()
+        removed.append(retry_root)
+    elif retry_root.is_dir():
+        shutil.rmtree(retry_root)
+        removed.append(retry_root)
+    if steam_library is not None:
+        removed.extend(_remove_steam_retry_helper(steam_library))
     return removed
+
+
+def _wine_paths(path: Path, prefix: Path) -> list[str]:
+    host = path.resolve(strict=True)
+    mappings: list[tuple[int, str, Path]] = []
+    for mapping in (prefix / "pfx" / "dosdevices").glob("?:"):
+        try:
+            root = mapping.resolve(strict=True)
+            relative = host.relative_to(root)
+        except (OSError, ValueError):
+            continue
+        mappings.append((len(root.parts), mapping.name[0].upper(), relative))
+    if not mappings:
+        raise OSError(f"No Wine drive maps this path: {host}")
+    paths = []
+    for _, drive, relative in sorted(mappings, key=lambda item: item[0], reverse=True):
+        suffix = "\\".join(relative.parts)
+        paths.append(f"{drive}:\\{suffix}" if suffix else f"{drive}:\\")
+    return paths
+
+
+def _to_wine_path(path: Path, prefix: Path) -> str:
+    return _wine_paths(path, prefix)[0]
+
+
+def _prepare_steam_retry_helper(
+    library: Path,
+    helper: Path = STEAM_RETRY_HELPER,
+) -> Path:
+    if not helper.is_file():
+        raise OSError(f"Steam retry helper is missing: {helper}")
+    library = library.resolve(strict=True)
+    destination, marker = _steam_retry_paths(library)
+    if destination.exists() and not destination.is_file():
+        raise OSError(f"Refusing to replace a non-file path: {destination}")
+    if destination.is_file() and not marker.is_file():
+        if destination.read_bytes() != helper.read_bytes():
+            raise OSError(f"Refusing to replace an existing Steam.exe: {destination}")
+    shutil.copy2(helper, destination)
+    marker.write_text("Managed by Proton Launcher.\n", encoding="utf-8")
+    return library
+
+
+def _remove_legacy_steam_retry_directory(prefix: Path) -> None:
+    retry_root = _legacy_steam_retry_directory(prefix / "pfx")
+    if retry_root.is_symlink():
+        retry_root.unlink()
+    elif retry_root.is_dir():
+        shutil.rmtree(retry_root)
+
+
+def _configure_steam_retry_environment(
+    prefix: Path,
+    game_arguments: list[str],
+    game_environment: dict[str, str],
+    wemod_environment: dict[str, str],
+    app_id: str,
+) -> bool:
+    if len(game_arguments) < 2 or game_arguments[0] != "run":
+        return False
+    try:
+        target = _to_wine_path(Path(game_arguments[1]), prefix)
+        directory = _to_wine_path(Path.cwd(), prefix)
+    except OSError as error:
+        print(f"Warning: WeMod game retry is unavailable: {error}", file=sys.stderr)
+        return False
+    wemod_environment["PL_STEAM_RETRY_TARGET"] = target
+    wemod_environment["PL_STEAM_RETRY_ARGUMENTS"] = subprocess.list2cmdline(
+        game_arguments[2:]
+    )
+    wemod_environment["PL_STEAM_RETRY_DIRECTORY"] = directory
+    if "WINEDLLOVERRIDES" in game_environment:
+        wemod_environment["PL_STEAM_RETRY_HAS_WINEDLLOVERRIDES"] = "1"
+        wemod_environment["PL_STEAM_RETRY_WINEDLLOVERRIDES"] = game_environment[
+            "WINEDLLOVERRIDES"
+        ]
+    else:
+        wemod_environment.pop("PL_STEAM_RETRY_HAS_WINEDLLOVERRIDES", None)
+        wemod_environment.pop("PL_STEAM_RETRY_WINEDLLOVERRIDES", None)
+    if app_id:
+        wemod_environment["PL_STEAM_RETRY_STEAM_APP_ID"] = app_id
+    else:
+        wemod_environment.pop("PL_STEAM_RETRY_STEAM_APP_ID", None)
+    overrides = wemod_environment.get("WINEDLLOVERRIDES", "")
+    names = {
+        name.strip().casefold()
+        for item in overrides.split(";")
+        if item.strip()
+        for name in item.partition("=")[0].split(",")
+        if name.strip()
+    }
+    if "steam.exe" not in names:
+        wemod_environment["WINEDLLOVERRIDES"] = ";".join(
+            item for item in (overrides, STEAM_RETRY_NATIVE_OVERRIDE) if item
+        )
+    wemod_environment["SteamGameId"] = STEAM_RETRY_NATIVE_APP_ID
+    return True
+
+
+def _register_steam_library(
+    proton: str,
+    prefix: Path,
+    library: Path,
+    environment: dict[str, str],
+) -> bool:
+    try:
+        wine_library = _to_wine_path(library, prefix)
+    except OSError as error:
+        print(
+            f"Warning: WeMod Steam detection was not configured: {error}",
+            file=sys.stderr,
+        )
+        return False
+    command = [
+        proton,
+        "runinprefix",
+        "reg",
+        "add",
+        r"HKLM\Software\Valve\Steam",
+        "/v",
+        "InstallPath",
+        "/t",
+        "REG_SZ",
+        "/d",
+        wine_library,
+        "/f",
+        "/reg:32",
+    ]
+    registry_environment = dict(environment)
+    registry_environment.pop("WINEDLLOVERRIDES", None)
+    try:
+        result = subprocess.run(
+            command,
+            env=registry_environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=REGISTRY_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            "Warning: WeMod Steam detection registry update timed out after "
+            f"{REGISTRY_TIMEOUT:.0f} seconds",
+            file=sys.stderr,
+        )
+        return False
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip()
+        print(
+            "Warning: WeMod Steam detection registry update failed"
+            + (f": {detail}" if detail else ""),
+            file=sys.stderr,
+        )
+        return False
+    print(f"Registered Steam library for WeMod detection: {wine_library}", flush=True)
+    return True
+
+
+def _custom_game_mapping(
+    wemod_executable: Path,
+    prefix: Path,
+    game_arguments: list[str],
+    use_cache: bool = True,
+) -> WeModGameMapping | None:
+    if len(game_arguments) < 2 or game_arguments[0] != "run":
+        return None
+    executable = Path(game_arguments[1])
+    if use_cache:
+        mapping = load_cached_mapping(executable)
+        if mapping:
+            return mapping
+    try:
+        wine_executables = _wine_paths(executable, prefix)
+    except OSError:
+        return None
+    mapping = discover_custom_mapping(
+        wemod_executable,
+        executable,
+        wine_executables,
+    )
+    if mapping:
+        try:
+            save_cached_mapping(mapping)
+        except OSError as error:
+            print(
+                f"Warning: could not save the WeMod match: {error}",
+                file=sys.stderr,
+            )
+    return mapping
 
 
 def _selected_proton_version(proton: Path) -> str:
@@ -192,13 +443,15 @@ def _wait_until_wemod_ready(
 
 
 def main() -> int:
-    if len(sys.argv) != 4:
+    wemod_only = len(sys.argv) == 5 and sys.argv[4] == "--wemod-only"
+    if len(sys.argv) not in {4, 5} or (len(sys.argv) == 5 and not wemod_only):
         print(
-            "Usage: wemod_bridge.py PROTON WEMOD_EXE GAME_ARGUMENTS_JSON",
+            "Usage: wemod_bridge.py PROTON WEMOD_EXE GAME_ARGUMENTS_JSON "
+            "[--wemod-only]",
             file=sys.stderr,
         )
         return 2
-    proton, wemod_executable, encoded_arguments = sys.argv[1:]
+    proton, wemod_executable, encoded_arguments = sys.argv[1:4]
     game_arguments = json.loads(encoded_arguments)
     if not isinstance(game_arguments, list) or not all(
         isinstance(item, str) for item in game_arguments
@@ -210,6 +463,8 @@ def main() -> int:
     prefix = Path(game_environment.get("STEAM_COMPAT_DATA_PATH", ""))
     marker = prefix / "pfx" / ".wemod_installer"
     wemod_overrides = game_environment.pop(WEMOD_VARIABLE, "")
+    steam_library = game_environment.pop(STEAM_LIBRARY_VARIABLE, "")
+    steam_app_id = game_environment.pop(STEAM_APP_ID_VARIABLE, "")
     wemod_environment = dict(game_environment)
     if wemod_overrides:
         wemod_environment["WINEDLLOVERRIDES"] = wemod_overrides
@@ -241,6 +496,63 @@ def main() -> int:
             return 2
         print("WeMod prefix initialization completed", flush=True)
 
+    if steam_library:
+        library = Path(steam_library)
+        if not wemod_only:
+            try:
+                retry_environment = dict(wemod_environment)
+                configured = _configure_steam_retry_environment(
+                    prefix,
+                    game_arguments,
+                    game_environment,
+                    retry_environment,
+                    steam_app_id,
+                )
+                if not configured:
+                    raise OSError("the selected launch mode cannot be retried")
+                _prepare_steam_retry_helper(library)
+                wemod_environment.clear()
+                wemod_environment.update(retry_environment)
+            except OSError as error:
+                print(
+                    "Warning: WeMod can detect this Steam game but cannot "
+                    f"restart it: {error}",
+                    file=sys.stderr,
+                )
+        try:
+            _remove_legacy_steam_retry_directory(prefix)
+        except OSError as error:
+            print(
+                f"Warning: could not remove the old WeMod Steam view: {error}",
+                file=sys.stderr,
+            )
+        _register_steam_library(
+            proton,
+            prefix,
+            library,
+            wemod_environment,
+        )
+
+    mapping = None
+    if not steam_library and not wemod_only:
+        mapping = _custom_game_mapping(
+            Path(wemod_executable),
+            prefix,
+            game_arguments,
+        )
+        if mapping:
+            print(
+                "Opening the saved WeMod game "
+                f"(title {mapping.title_id}, game {mapping.game_id})",
+                flush=True,
+            )
+        else:
+            print(
+                "No WeMod match is saved for this executable. Select it once "
+                "in WeMod; Proton Launcher will remember the match.",
+                flush=True,
+            )
+
     game_overrides = game_environment.get("WINEDLLOVERRIDES", "<unset>")
     effective_wemod_overrides = wemod_environment.get("WINEDLLOVERRIDES", "<unset>")
     print(f"Game WINEDLLOVERRIDES: {game_overrides}", flush=True)
@@ -250,10 +562,10 @@ def main() -> int:
         proton,
         "run",
         wemod_executable,
-        "--disable-gpu",
-        "--disable-software-rasterizer",
-        "--disable-gpu-compositing",
+        *WEMOD_RENDER_ARGUMENTS,
     ]
+    if mapping:
+        wemod_command.append(mapping.uri)
     print("WeMod: $ " + " ".join(wemod_command), flush=True)
     baseline = set(_wemod_processes())
     wemod = subprocess.Popen(
@@ -277,15 +589,49 @@ def main() -> int:
     else:
         print(
             "Warning: could not confirm WeMod renderer readiness within "
-            f"{WEMOD_READY_TIMEOUT:.0f} seconds; launching the game anyway",
+            f"{WEMOD_READY_TIMEOUT:.0f} seconds"
+            + ("" if wemod_only else "; launching the game anyway"),
             file=sys.stderr,
             flush=True,
         )
 
+    if wemod_only:
+        print("WeMod is running in the selected prefix", flush=True)
+        return wemod.wait()
+
+    if not steam_library and mapping is None:
+        mapping = _custom_game_mapping(
+            Path(wemod_executable),
+            prefix,
+            game_arguments,
+            use_cache=False,
+        )
+        if mapping:
+            activation_command = [proton, "run", wemod_executable, mapping.uri]
+            print("WeMod title: $ " + " ".join(activation_command), flush=True)
+            subprocess.Popen(
+                activation_command,
+                env=wemod_environment,
+                cwd=str(Path(wemod_executable).parent),
+            )
+
     game_command = [proton, *game_arguments]
     print("Game: $ " + " ".join(game_command), flush=True)
     game = subprocess.Popen(game_command, env=game_environment)
-    return game.wait()
+    return_code = game.wait()
+    if not steam_library:
+        learned = _custom_game_mapping(
+            Path(wemod_executable),
+            prefix,
+            game_arguments,
+            use_cache=False,
+        )
+        if learned and learned != mapping:
+            print(
+                "Saved the WeMod match for " + Path(learned.executable).name,
+                flush=True,
+            )
+    return return_code
 
 
 if __name__ == "__main__":

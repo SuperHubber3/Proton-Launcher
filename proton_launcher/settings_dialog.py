@@ -6,6 +6,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices, QPalette
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -18,6 +19,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMessageBox,
     QPushButton,
     QTabWidget,
     QVBoxLayout,
@@ -28,6 +30,12 @@ from .profiles import ConfigStore
 from .proton import DEFAULT_ROOTS
 from .sessions import state_root
 from .steam import DEFAULT_STEAM_ROOTS
+from .wemod_map import (
+    apply_map_browser_patch,
+    map_patch_state,
+    restore_wemod_maps,
+    wemod_asar_path,
+)
 
 
 class LocationEditor(QGroupBox):
@@ -225,17 +233,26 @@ class SettingsDialog(QDialog):
         integrations = QWidget()
         integration_form = QFormLayout(integrations)
         self.wemod_path = QLineEdit(store.settings["wemod_launcher_path"])
+        self.wemod_path.editingFinished.connect(self._update_map_status)
         browse = QPushButton("Browse…")
         browse.clicked.connect(self._browse_wemod)
         path_row = QHBoxLayout()
         path_row.addWidget(self.wemod_path, 1)
         path_row.addWidget(browse)
-        launch_mode = QLabel(
-            "WeMod and the game use coordinated Proton processes with separate environments."
-        )
-        launch_mode.setWordWrap(True)
+        launch_mode = QLabel("Separate Proton processes and environments")
         integration_form.addRow("WeMod Launcher", path_row)
         integration_form.addRow("Launch mode", launch_mode)
+        map_row = QHBoxLayout()
+        self.map_status = QLabel()
+        self.map_status.setWordWrap(True)
+        map_row.addWidget(self.map_status, 1)
+        self.map_patch_button = QPushButton("Open maps in browser")
+        self.map_patch_button.clicked.connect(self._patch_wemod_maps)
+        map_row.addWidget(self.map_patch_button)
+        self.map_restore_button = QPushButton("Restore in-app maps")
+        self.map_restore_button.clicked.connect(self._restore_wemod_maps)
+        map_row.addWidget(self.map_restore_button)
+        integration_form.addRow("Maps", map_row)
         renderers = []
         for root_path in steam_roots:
             for architecture in ("ubuntu12_32", "ubuntu12_64"):
@@ -253,6 +270,7 @@ class SettingsDialog(QDialog):
         self.tabs.setCurrentIndex(
             {"general": 0, "locations": 1, "integrations": 2}.get(initial_tab, 0)
         )
+        self._update_map_status()
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self._save)
@@ -265,6 +283,64 @@ class SettingsDialog(QDialog):
         )
         if path:
             self.wemod_path.setText(path)
+            self._update_map_status()
+
+    def _update_map_status(self) -> None:
+        configured = self.wemod_path.text().strip()
+        state = (
+            map_patch_state(wemod_asar_path(configured)) if configured else "missing"
+        )
+        labels = {
+            "missing": "WeMod installation not found",
+            "available": "Embedded in WeMod",
+            "patched": "Opens in the system browser",
+            "unsupported": "Unsupported WeMod build",
+        }
+        self.map_status.setText(labels[state])
+        self.map_patch_button.setEnabled(state == "available")
+        self.map_restore_button.setEnabled(state == "patched")
+
+    def _patch_wemod_maps(self) -> None:
+        asar = wemod_asar_path(self.wemod_path.text().strip())
+        caught: OSError | ValueError | None = None
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            apply_map_browser_patch(asar)
+            self._update_map_status()
+        except (OSError, ValueError) as error:
+            caught = error
+        finally:
+            QApplication.restoreOverrideCursor()
+        if caught is not None:
+            QMessageBox.warning(self, "Could not patch WeMod maps", str(caught))
+            return
+        QMessageBox.information(
+            self,
+            "WeMod maps",
+            "WeMod maps will open in the system browser. The original app.asar "
+            "was backed up and can be restored here. Restart WeMod if it is "
+            "currently running.",
+        )
+
+    def _restore_wemod_maps(self) -> None:
+        asar = wemod_asar_path(self.wemod_path.text().strip())
+        caught: OSError | ValueError | None = None
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            restore_wemod_maps(asar)
+            self._update_map_status()
+        except (OSError, ValueError) as error:
+            caught = error
+        finally:
+            QApplication.restoreOverrideCursor()
+        if caught is not None:
+            QMessageBox.warning(self, "Could not restore WeMod maps", str(caught))
+            return
+        QMessageBox.information(
+            self,
+            "WeMod maps",
+            "In-app maps were restored. Restart WeMod if it is currently running.",
+        )
 
     def _save(self) -> None:
         mode, path = self.default_proton.currentData()
