@@ -37,7 +37,7 @@ def parse_rating(data: bytes) -> str | None:
 
 def _app_id(value: str) -> int | None:
     value = value.strip().lstrip("\ufeff")
-    if not value.isdigit():
+    if not value.isascii() or not value.isdigit():
         return None
     app_id = int(value)
     return app_id if 0 < app_id <= MAX_APP_ID else None
@@ -96,6 +96,13 @@ def _online_fix_app_id(path: Path) -> int | None:
         return None
 
 
+def _steam_app_id(path: Path) -> int | None:
+    try:
+        return _app_id(path.read_text(encoding="utf-8-sig", errors="replace"))
+    except OSError:
+        return None
+
+
 def protondb_app_id(game: GameEntry) -> int | None:
     if game.source == GameSource.STEAM:
         return game.app_id
@@ -128,24 +135,14 @@ def protondb_app_id(game: GameEntry) -> int | None:
     for directory in directories:
         steam_appid = _metadata_file(directory, "steam_appid.txt")
         if steam_appid:
-            try:
-                app_id = _app_id(
-                    steam_appid.read_text(encoding="utf-8-sig", errors="replace")
-                )
-            except OSError:
-                continue
+            app_id = _steam_app_id(steam_appid)
             if app_id:
                 return app_id
     if executable_directory:
         for steam_appid in _nested_metadata_files(
             executable_directory, "steam_appid.txt"
         ):
-            try:
-                app_id = _app_id(
-                    steam_appid.read_text(encoding="utf-8-sig", errors="replace")
-                )
-            except OSError:
-                continue
+            app_id = _steam_app_id(steam_appid)
             if app_id:
                 return app_id
     return None

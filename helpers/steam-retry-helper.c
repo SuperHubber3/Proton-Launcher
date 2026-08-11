@@ -10,6 +10,7 @@ static WCHAR directory[BUFFER_LENGTH];
 static WCHAR overrides[BUFFER_LENGTH];
 static WCHAR steam_app_id[64];
 static WCHAR command_line[BUFFER_LENGTH];
+static WCHAR has_overrides[2];
 
 void WINAPI mainCRTStartup(void)
 {
@@ -43,7 +44,7 @@ void WINAPI mainCRTStartup(void)
     if (overrides_length >= BUFFER_LENGTH)
         ExitProcess(5);
     if (GetEnvironmentVariableW(
-            L"PL_STEAM_RETRY_HAS_WINEDLLOVERRIDES", command_line, BUFFER_LENGTH))
+            L"PL_STEAM_RETRY_HAS_WINEDLLOVERRIDES", has_overrides, 2))
         SetEnvironmentVariableW(L"WINEDLLOVERRIDES", overrides);
     else
         SetEnvironmentVariableW(L"WINEDLLOVERRIDES", NULL);

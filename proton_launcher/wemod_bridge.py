@@ -43,10 +43,34 @@ STEAM_RETRY_NATIVE_OVERRIDE = "steam.exe=n,b"
 WEMOD_RENDER_ARGUMENTS = ("--enable-logging=file",)
 WEMOD_READY_TIMEOUT = 45.0
 WEMOD_READY_SETTLE_TIME = 2.0
+REGISTRY_TIMEOUT = 30.0
 
 
-def reset_wemod_prefix(prefix: Path) -> list[Path]:
-    """Remove launcher-managed WeMod files from a prefix."""
+def _legacy_steam_retry_directory(pfx: Path) -> Path:
+    return pfx / "drive_c" / "ProtonLauncher" / "Steam"
+
+
+def _steam_retry_paths(library: Path) -> tuple[Path, Path]:
+    return library / "Steam.exe", library / STEAM_RETRY_MARKER
+
+
+def _remove_steam_retry_helper(library: Path) -> list[Path]:
+    destination, marker = _steam_retry_paths(library.resolve(strict=False))
+    if not marker.is_file():
+        return []
+    if destination.exists() and not destination.is_file():
+        raise OSError(f"Refusing to remove a non-file path: {destination}")
+    removed = []
+    if destination.is_file():
+        destination.unlink()
+        removed.append(destination)
+    marker.unlink()
+    removed.append(marker)
+    return removed
+
+
+def reset_wemod_prefix(prefix: Path, steam_library: Path | None = None) -> list[Path]:
+    """Remove launcher-managed WeMod setup files."""
     pfx = prefix.resolve(strict=False) / "pfx"
     candidates = (
         pfx / ".wemod_installer",
@@ -57,13 +81,15 @@ def reset_wemod_prefix(prefix: Path) -> list[Path]:
         if path.is_symlink() or (path == candidates[0] and path.is_file()):
             path.unlink()
             removed.append(path)
-    retry_root = pfx / "drive_c" / "ProtonLauncher" / "Steam"
+    retry_root = _legacy_steam_retry_directory(pfx)
     if retry_root.is_symlink():
         retry_root.unlink()
         removed.append(retry_root)
     elif retry_root.is_dir():
         shutil.rmtree(retry_root)
         removed.append(retry_root)
+    if steam_library is not None:
+        removed.extend(_remove_steam_retry_helper(steam_library))
     return removed
 
 
@@ -97,8 +123,7 @@ def _prepare_steam_retry_helper(
     if not helper.is_file():
         raise OSError(f"Steam retry helper is missing: {helper}")
     library = library.resolve(strict=True)
-    destination = library / "Steam.exe"
-    marker = library / STEAM_RETRY_MARKER
+    destination, marker = _steam_retry_paths(library)
     if destination.exists() and not destination.is_file():
         raise OSError(f"Refusing to replace a non-file path: {destination}")
     if destination.is_file() and not marker.is_file():
@@ -110,7 +135,7 @@ def _prepare_steam_retry_helper(
 
 
 def _remove_legacy_steam_retry_directory(prefix: Path) -> None:
-    retry_root = prefix / "pfx" / "drive_c" / "ProtonLauncher" / "Steam"
+    retry_root = _legacy_steam_retry_directory(prefix / "pfx")
     if retry_root.is_symlink():
         retry_root.unlink()
     elif retry_root.is_dir():
@@ -147,11 +172,15 @@ def _configure_steam_retry_environment(
         wemod_environment.pop("PL_STEAM_RETRY_WINEDLLOVERRIDES", None)
     if app_id:
         wemod_environment["PL_STEAM_RETRY_STEAM_APP_ID"] = app_id
+    else:
+        wemod_environment.pop("PL_STEAM_RETRY_STEAM_APP_ID", None)
     overrides = wemod_environment.get("WINEDLLOVERRIDES", "")
     names = {
-        item.partition("=")[0].strip().casefold()
+        name.strip().casefold()
         for item in overrides.split(";")
         if item.strip()
+        for name in item.partition("=")[0].split(",")
+        if name.strip()
     }
     if "steam.exe" not in names:
         wemod_environment["WINEDLLOVERRIDES"] = ";".join(
@@ -192,13 +221,22 @@ def _register_steam_library(
     ]
     registry_environment = dict(environment)
     registry_environment.pop("WINEDLLOVERRIDES", None)
-    result = subprocess.run(
-        command,
-        env=registry_environment,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            command,
+            env=registry_environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=REGISTRY_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            "Warning: WeMod Steam detection registry update timed out after "
+            f"{REGISTRY_TIMEOUT:.0f} seconds",
+            file=sys.stderr,
+        )
+        return False
     if result.returncode:
         detail = result.stderr.strip() or result.stdout.strip()
         print(
@@ -462,16 +500,19 @@ def main() -> int:
         library = Path(steam_library)
         if not wemod_only:
             try:
+                retry_environment = dict(wemod_environment)
                 configured = _configure_steam_retry_environment(
                     prefix,
                     game_arguments,
                     game_environment,
-                    wemod_environment,
+                    retry_environment,
                     steam_app_id,
                 )
                 if not configured:
                     raise OSError("the selected launch mode cannot be retried")
                 _prepare_steam_retry_helper(library)
+                wemod_environment.clear()
+                wemod_environment.update(retry_environment)
             except OSError as error:
                 print(
                     "Warning: WeMod can detect this Steam game but cannot "

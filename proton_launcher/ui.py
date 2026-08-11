@@ -92,6 +92,7 @@ class MainWindow(QMainWindow):
         self.session_records: dict[str, SessionRecord] = {}
         self.log_offsets: dict[str, int] = {}
         self.protondb_cache: dict[int, str | None] = {}
+        self.protondb_app_ids: dict[str, int | None] = {}
         self.protondb_pending: set[int] = set()
         self.current_protondb_app_id: int | None = None
         self._force_quit = False
@@ -448,6 +449,7 @@ class MainWindow(QMainWindow):
         self.followup_delay_spin.valueChanged.connect(self._field_changed)
 
     def refresh(self) -> None:
+        self.protondb_app_ids.clear()
         selected = (
             self.game_combo.currentData()
             if self.game_combo.count()
@@ -493,7 +495,11 @@ class MainWindow(QMainWindow):
         return next((game for game in self.games if game.key == key), None)
 
     def _update_protondb_rating(self, game: GameEntry | None) -> None:
-        app_id = protondb_app_id(game) if game else None
+        app_id = None
+        if game:
+            if game.key not in self.protondb_app_ids:
+                self.protondb_app_ids[game.key] = protondb_app_id(game)
+            app_id = self.protondb_app_ids[game.key]
         self.current_protondb_app_id = app_id
         if not app_id:
             self.protondb_button.setText("ProtonDB")
@@ -1158,7 +1164,9 @@ class MainWindow(QMainWindow):
             and (self._prefix_for_game(game) / "pfx" / ".wemod_installer").is_file()
         )
         self.delete_wemod_button.setEnabled(initialized)
-        self.launch_wemod_button.setEnabled(self._wemod_is_configured())
+        self.launch_wemod_button.setEnabled(
+            self._wemod_is_configured() and not self.sessions.records(SessionKind.WEMOD)
+        )
         if not path:
             self.wemod_status.setText("Not configured")
             return
@@ -1190,6 +1198,7 @@ class MainWindow(QMainWindow):
             f"Remove WeMod setup from the prefix for {game.name}?\n\n"
             f"{prefix}\n\n"
             "The game prefix, saves, and shared WeMod login data are kept. "
+            "The managed retry helper in this Steam library is removed. "
             "The next Launch with WeMod will run setup again and may offer to "
             "copy a compatible initialized prefix.\n\n"
             "Installed .NET files and registry changes are shared with Wine and "
@@ -1205,7 +1214,7 @@ class MainWindow(QMainWindow):
                 self.sessions.stop(record)
 
         try:
-            removed = reset_wemod_prefix(prefix)
+            removed = reset_wemod_prefix(prefix, game.library_root)
         except OSError as error:
             QMessageBox.critical(self, "Could not delete WeMod setup", str(error))
             self._log(f"WeMod setup deletion failed for {prefix}: {error}")

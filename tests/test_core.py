@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import struct
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -142,6 +143,8 @@ class CoreTests(unittest.TestCase):
         )
 
         self.assertEqual(protondb_app_id(game), 1593500)
+        (game_dir / "STEAM_APPID.TXT").write_text("\u00b2\n")
+        self.assertIsNone(protondb_app_id(game))
 
     def test_bundled_steam_retry_helper_is_x64_pe(self):
         helper = (
@@ -171,6 +174,9 @@ class CoreTests(unittest.TestCase):
         asar = self.tmp / "app.asar"
         original = b"before" + MAP_IFRAME + MAP_ANALYTICS + b"after"
         asar.write_bytes(original)
+        map_patch_backup(asar).write_bytes(
+            b"stale" + MAP_IFRAME + MAP_ANALYTICS + b"backup"
+        )
 
         self.assertEqual(map_patch_state(asar), "available")
         self.assertTrue(apply_map_browser_patch(asar))
@@ -181,6 +187,15 @@ class CoreTests(unittest.TestCase):
 
         self.assertTrue(restore_wemod_maps(asar))
         self.assertEqual(map_patch_state(asar), "available")
+        self.assertEqual(asar.read_bytes(), original)
+        self.assertFalse(map_patch_backup(asar).exists())
+
+        with patch(
+            "proton_launcher.wemod_map.map_patch_state",
+            side_effect=["available", "unsupported"],
+        ):
+            with self.assertRaisesRegex(OSError, "could not be verified"):
+                apply_map_browser_patch(asar)
         self.assertEqual(asar.read_bytes(), original)
 
     def test_process_environment_preserves_vulkan_driver_discovery(self):
@@ -233,7 +248,7 @@ class CoreTests(unittest.TestCase):
             "catalog": {"games": {"122174": {"id": "122174", "titleId": "112621"}}},
             "installedApps": {},
             "trainerFeedbackRequests": {
-                r"49541:custom:122174_z:\home\zenny\games\big walk\big walk.exe:1779869447": []
+                r"ß:CuStOm:122174_z:\home\zenny\games\big walk\big walk.exe:1779869447": []
             },
         }
 
@@ -335,18 +350,36 @@ class CoreTests(unittest.TestCase):
         retry_root = prefix / "pfx" / "drive_c" / "ProtonLauncher" / "Steam"
         retry_root.mkdir(parents=True)
         (retry_root / "Steam.exe").touch()
+        library = self.tmp / "library"
+        library.mkdir()
+        retry_helper = library / "Steam.exe"
+        retry_marker = library / ".proton-launcher-steam-retry"
+        retry_helper.touch()
+        retry_marker.write_text("Managed by Proton Launcher.\n")
         game_file = prefix / "pfx" / "drive_c" / "game" / "save.dat"
         game_file.parent.mkdir(parents=True)
         game_file.touch()
 
-        removed = reset_wemod_prefix(prefix)
+        removed = reset_wemod_prefix(prefix, library)
 
-        self.assertEqual(removed, [marker, prefix_data, retry_root])
+        self.assertEqual(
+            removed,
+            [marker, prefix_data, retry_root, retry_helper, retry_marker],
+        )
         self.assertFalse(marker.exists())
         self.assertFalse(prefix_data.exists())
         self.assertFalse(retry_root.exists())
+        self.assertFalse(retry_helper.exists())
+        self.assertFalse(retry_marker.exists())
         self.assertTrue(shared_data.is_dir())
         self.assertTrue(game_file.is_file())
+
+        unmanaged_library = self.tmp / "unmanaged-library"
+        unmanaged_library.mkdir()
+        unmanaged_steam = unmanaged_library / "Steam.exe"
+        unmanaged_steam.write_bytes(b"unmanaged")
+        self.assertEqual(reset_wemod_prefix(prefix, unmanaged_library), [])
+        self.assertEqual(unmanaged_steam.read_bytes(), b"unmanaged")
 
     def test_wemod_initializer_scans_sibling_prefixes(self):
         tool = self.tmp / "Proton"
@@ -411,6 +444,15 @@ class CoreTests(unittest.TestCase):
             ],
         )
         self.assertEqual(run.call_args.kwargs["env"], {"TEST": "value"})
+        self.assertEqual(run.call_args.kwargs["timeout"], 30.0)
+
+        with patch(
+            "proton_launcher.wemod_bridge.subprocess.run",
+            side_effect=subprocess.TimeoutExpired("reg", 30),
+        ):
+            self.assertFalse(
+                _register_steam_library("proton", prefix, library, environment)
+            )
 
     def test_wemod_steam_retry_helper_is_copied_to_real_library(self):
         library = self.tmp / "library"
@@ -479,7 +521,10 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(wemod_environment["SteamGameId"], STEAM_RETRY_NATIVE_APP_ID)
 
     def test_wemod_steam_retry_keeps_an_existing_native_steam_override(self):
-        wemod_environment = {"WINEDLLOVERRIDES": "steam.exe=n;version=n,b"}
+        wemod_environment = {
+            "WINEDLLOVERRIDES": "steam.exe,other=n;version=n,b",
+            "PL_STEAM_RETRY_STEAM_APP_ID": "stale",
+        }
         with patch(
             "proton_launcher.wemod_bridge._to_wine_path",
             side_effect=[r"Z:\Games\game.exe", r"Z:\Games"],
@@ -489,13 +534,15 @@ class CoreTests(unittest.TestCase):
                 ["run", str(self.tmp / "game.exe")],
                 {},
                 wemod_environment,
-                "1593500",
+                "",
             )
 
         self.assertTrue(configured)
         self.assertEqual(
-            wemod_environment["WINEDLLOVERRIDES"], "steam.exe=n;version=n,b"
+            wemod_environment["WINEDLLOVERRIDES"],
+            "steam.exe,other=n;version=n,b",
         )
+        self.assertNotIn("PL_STEAM_RETRY_STEAM_APP_ID", wemod_environment)
 
     def test_wemod_initializer_uses_launchers_virtual_environment(self):
         root = self.tmp / "wemod-launcher"
@@ -823,7 +870,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(spec.environment[WEMOD_STEAM_LIBRARY_VARIABLE], str(library))
         self.assertEqual(spec.environment[WEMOD_STEAM_APP_ID_VARIABLE], "123")
 
-    def test_standalone_wemod_bridge_does_not_launch_a_game(self):
+    def test_wemod_bridge_launch_modes_keep_retry_setup_transactional(self):
         prefix = self.tmp / "compatdata" / "123"
         marker = prefix / "pfx" / ".wemod_installer"
         marker.parent.mkdir(parents=True)
@@ -864,6 +911,67 @@ class CoreTests(unittest.TestCase):
             ["proton", "run", "WeMod.exe", *WEMOD_RENDER_ARGUMENTS],
         )
         popen.return_value.wait.assert_called_once_with()
+
+        library = self.tmp / "Steam Library"
+        library.mkdir()
+        executable = self.tmp / "game.exe"
+        executable.touch()
+        steam_environment = {
+            "STEAM_COMPAT_DATA_PATH": str(prefix),
+            "PL_WEMOD_WINEDLLOVERRIDES": DEFAULT_WEMOD_WINEDLLOVERRIDES,
+            "PL_WEMOD_STEAM_LIBRARY": str(library),
+            "PL_WEMOD_STEAM_APP_ID": "123",
+        }
+
+        def configure_retry(_prefix, _arguments, _game, candidate, _app_id):
+            candidate["WINEDLLOVERRIDES"] += ";steam.exe=n,b"
+            candidate["SteamGameId"] = "352130"
+            return True
+
+        with (
+            patch(
+                "proton_launcher.wemod_bridge.sys.argv",
+                [
+                    "wemod_bridge.py",
+                    "proton",
+                    "WeMod.exe",
+                    json.dumps(["run", str(executable)]),
+                ],
+            ),
+            patch.dict(
+                "proton_launcher.wemod_bridge.os.environ",
+                steam_environment,
+                clear=True,
+            ),
+            patch("proton_launcher.wemod_bridge._wemod_processes", return_value={}),
+            patch(
+                "proton_launcher.wemod_bridge._wait_until_wemod_ready",
+                return_value=True,
+            ),
+            patch(
+                "proton_launcher.wemod_bridge._configure_steam_retry_environment",
+                side_effect=configure_retry,
+            ),
+            patch(
+                "proton_launcher.wemod_bridge._prepare_steam_retry_helper",
+                side_effect=OSError("install failed"),
+            ),
+            patch(
+                "proton_launcher.wemod_bridge._register_steam_library",
+                return_value=True,
+            ),
+            patch("proton_launcher.wemod_bridge.subprocess.Popen") as retry_popen,
+        ):
+            retry_popen.return_value.wait.return_value = 0
+            return_code = wemod_bridge_main()
+
+        self.assertEqual(return_code, 0)
+        wemod_environment = retry_popen.call_args_list[0].kwargs["env"]
+        self.assertEqual(
+            wemod_environment["WINEDLLOVERRIDES"],
+            DEFAULT_WEMOD_WINEDLLOVERRIDES,
+        )
+        self.assertNotIn("SteamGameId", wemod_environment)
 
     def test_wemod_and_game_receive_separate_dll_overrides(self):
         tool = self.tmp / "Proton"

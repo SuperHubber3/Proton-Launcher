@@ -22,6 +22,7 @@ from proton_launcher.models import (
     ProtonInstallation,
 )  # noqa: E402
 from proton_launcher.profiles import ConfigStore  # noqa: E402
+from proton_launcher.protondb import protondb_app_id  # noqa: E402
 from proton_launcher.ui import MainWindow  # noqa: E402
 
 
@@ -153,8 +154,15 @@ class UiTests(unittest.TestCase):
             "[Main]\nRealAppId=3844970\nFakeAppId=480\n"
         )
         self.window.protondb_cache[3844970] = "Platinum"
+        self.window.protondb_app_ids.clear()
 
-        self.window.game_changed()
+        with patch(
+            "proton_launcher.ui.protondb_app_id",
+            wraps=protondb_app_id,
+        ) as resolve_app_id:
+            self.window.game_changed()
+            self.window.game_changed()
+        resolve_app_id.assert_called_once_with(game)
 
         self.assertEqual(self.window.protondb_button.text(), "ProtonDB: Platinum")
         self.assertTrue(self.window.protondb_button.isEnabled())
@@ -219,6 +227,10 @@ class UiTests(unittest.TestCase):
         self.window.store.settings["wemod_launcher_path"] = str(launcher)
         self.window._update_wemod_status()
         self.assertTrue(self.window.launch_wemod_button.isEnabled())
+        with patch.object(self.window.sessions, "records", return_value=[object()]):
+            self.window._update_wemod_status()
+        self.assertFalse(self.window.launch_wemod_button.isEnabled())
+        self.window._update_wemod_status()
 
         with (
             patch.object(self.window.sessions, "start") as start,
@@ -231,7 +243,10 @@ class UiTests(unittest.TestCase):
         self.assertEqual(kind.value, "wemod")
         self.assertEqual(game_key, self.window.current_game().key)
         self.assertEqual(game_name, self.window.current_game().name)
-        self.assertEqual(prefix, self.window.current_game().default_prefix)
+        self.assertEqual(
+            prefix,
+            self.window.current_game().default_prefix.resolve(strict=False),
+        )
         self.assertEqual(spec.arguments[-1], "--wemod-only")
 
     def test_delete_wemod_requires_confirmation_and_keeps_prefix(self):

@@ -13,8 +13,8 @@ MAP_BROWSER = b"x(t.url);this.loading=0;"
 MAP_ANALYTICS = b'this.#s.screenView({name:this.titleInfo.name,class:"Map"})'
 MAP_BROWSER_HOOK = b'globalThis.x=e=>require("electron").shell.openExternal(e) '
 
-assert len(MAP_IFRAME) == len(MAP_BROWSER)
-assert len(MAP_ANALYTICS) == len(MAP_BROWSER_HOOK)
+if len(MAP_IFRAME) != len(MAP_BROWSER) or len(MAP_ANALYTICS) != len(MAP_BROWSER_HOOK):
+    raise RuntimeError("WeMod map replacements must preserve the archive length")
 
 
 def wemod_asar_path(launcher: str | Path) -> Path:
@@ -77,6 +77,8 @@ def apply_map_browser_patch(asar: Path) -> bool:
     if backup.exists():
         if map_patch_state(backup) != "available":
             raise ValueError(f"The existing map backup is not usable: {backup}")
+        if backup.read_bytes() != asar.read_bytes():
+            shutil.copy2(asar, backup)
     else:
         shutil.copy2(asar, backup)
 
@@ -86,6 +88,7 @@ def apply_map_browser_patch(asar: Path) -> bool:
     )
     _replace_file(asar, patched)
     if map_patch_state(asar) != "patched":
+        _replace_file(asar, backup.read_bytes())
         raise OSError("The WeMod map patch could not be verified")
     return True
 
@@ -103,4 +106,5 @@ def restore_wemod_maps(asar: Path) -> bool:
     _replace_file(asar, backup.read_bytes())
     if map_patch_state(asar) != "available":
         raise OSError("The restored WeMod map code could not be verified")
+    backup.unlink(missing_ok=True)
     return True

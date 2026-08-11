@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import struct
 import tempfile
 from collections.abc import Iterator
@@ -182,6 +183,8 @@ def _decode_local_storage_value(value: bytes) -> str:
 
 
 def read_global_store(leveldb: Path) -> dict[str, Any] | None:
+    # This reads only LevelDB's write-ahead logs. A compacted key that exists
+    # only in an .ldb or .sst table is intentionally treated as unavailable.
     latest: tuple[int, bytes | None] | None = None
     for log in leveldb.glob("[0-9]*.log"):
         try:
@@ -221,11 +224,10 @@ def _custom_correlations(value: Any) -> Iterator[tuple[str, str]]:
 
 
 def _parse_custom_correlation(value: str) -> tuple[str, str] | None:
-    marker = "custom:"
-    marker_at = value.casefold().find(marker)
-    if marker_at < 0:
+    match = re.search(r"custom:", value, re.IGNORECASE)
+    if match is None:
         return None
-    game_and_path = value[marker_at + len(marker) :]
+    game_and_path = value[match.end() :]
     game_id, separator, location = game_and_path.partition("_")
     if not separator or not game_id.isdigit() or not location:
         return None

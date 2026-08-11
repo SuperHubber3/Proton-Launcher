@@ -163,7 +163,8 @@ path so WeMod sees the same executable path as the running game. A managed
 `Steam.exe` retry helper in that library lets WeMod relaunch the game after a
 crash. It uses the profile's executable, arguments, working directory, and game
 DLL overrides without asking the native Steam client to start an App ID that it
-still considers active. An existing `Steam.exe` is never overwritten.
+still considers active. Proton Launcher refuses to replace an unmanaged
+`Steam.exe`; managed files are identified by `.proton-launcher-steam-retry`.
 
 For a non-Steam game, find the title in WeMod and select the game's executable
 once. Proton Launcher reads that saved association after the game closes. On
@@ -175,9 +176,10 @@ Chromium database.
 During setup, wemod-launcher can offer to copy a compatible setup from another
 initialized prefix in the same `compatdata` directory. **Delete WeMod** removes
 the selected prefix's WeMod marker and local data link so setup runs again. It
-keeps the game prefix, saves, shared login data, and WeMod installation. .NET
-files and registry changes remain because they cannot be separated safely from
-the Wine prefix.
+also removes Proton Launcher's managed retry helper from the selected Steam
+library. The game prefix, saves, shared login data, and WeMod installation are
+kept. .NET files and registry changes remain because they cannot be separated
+safely from the Wine prefix.
 
 The game and WeMod use separate environments. Steam overlay preload variables
 are kept out of WeMod's Electron process so they cannot block its window.

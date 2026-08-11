@@ -6,6 +6,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices, QPalette
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -232,7 +233,7 @@ class SettingsDialog(QDialog):
         integrations = QWidget()
         integration_form = QFormLayout(integrations)
         self.wemod_path = QLineEdit(store.settings["wemod_launcher_path"])
-        self.wemod_path.textChanged.connect(self._update_map_status)
+        self.wemod_path.editingFinished.connect(self._update_map_status)
         browse = QPushButton("Browse…")
         browse.clicked.connect(self._browse_wemod)
         path_row = QHBoxLayout()
@@ -282,6 +283,7 @@ class SettingsDialog(QDialog):
         )
         if path:
             self.wemod_path.setText(path)
+            self._update_map_status()
 
     def _update_map_status(self) -> None:
         configured = self.wemod_path.text().strip()
@@ -300,12 +302,18 @@ class SettingsDialog(QDialog):
 
     def _patch_wemod_maps(self) -> None:
         asar = wemod_asar_path(self.wemod_path.text().strip())
+        caught: OSError | ValueError | None = None
+        QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             apply_map_browser_patch(asar)
+            self._update_map_status()
         except (OSError, ValueError) as error:
-            QMessageBox.warning(self, "Could not patch WeMod maps", str(error))
+            caught = error
+        finally:
+            QApplication.restoreOverrideCursor()
+        if caught is not None:
+            QMessageBox.warning(self, "Could not patch WeMod maps", str(caught))
             return
-        self._update_map_status()
         QMessageBox.information(
             self,
             "WeMod maps",
@@ -316,12 +324,23 @@ class SettingsDialog(QDialog):
 
     def _restore_wemod_maps(self) -> None:
         asar = wemod_asar_path(self.wemod_path.text().strip())
+        caught: OSError | ValueError | None = None
+        QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             restore_wemod_maps(asar)
+            self._update_map_status()
         except (OSError, ValueError) as error:
-            QMessageBox.warning(self, "Could not restore WeMod maps", str(error))
+            caught = error
+        finally:
+            QApplication.restoreOverrideCursor()
+        if caught is not None:
+            QMessageBox.warning(self, "Could not restore WeMod maps", str(caught))
             return
-        self._update_map_status()
+        QMessageBox.information(
+            self,
+            "WeMod maps",
+            "In-app maps were restored. Restart WeMod if it is currently running.",
+        )
 
     def _save(self) -> None:
         mode, path = self.default_proton.currentData()
