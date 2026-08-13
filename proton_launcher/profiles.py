@@ -98,6 +98,12 @@ class ConfigValidator:
         "followup_executable",
         "followup_command",
         "followup_arguments",
+        "dxvk_hud",
+        "wine_debug",
+        "gamescope_window_mode",
+        "gamescope_scaler",
+        "gamescope_filter",
+        "gamescope_extra_arguments",
     }
     PROFILE_BOOLEANS = {
         "use_default_proton",
@@ -106,9 +112,33 @@ class ConfigValidator:
         "inject_steam_overlay",
         "apply_online_fix",
         "launch_wemod",
+        "enable_gamemode",
+        "enable_mangohud",
+        "enable_gamescope",
+        "enable_wayland",
+        "prefer_discrete_gpu",
+        "enable_hdr",
+        "force_nvapi",
+        "disable_esync",
+        "disable_fsync",
+        "use_wined3d",
+        "enable_proton_log",
+        "force_large_address_aware",
+        "prefer_sdl_input",
+        "enable_wayland_raw_input",
+        "gamescope_adaptive_sync",
         "followup_enabled",
         "wait_for_primary_executable",
         "followup_run_as_admin",
+    }
+    PROFILE_INTEGERS = {
+        "gamescope_game_width",
+        "gamescope_game_height",
+        "gamescope_output_width",
+        "gamescope_output_height",
+        "gamescope_refresh_rate",
+        "gamescope_fps_limit",
+        "gamescope_sharpness",
     }
 
     @classmethod
@@ -365,19 +395,21 @@ class ConfigValidator:
                 )
             )
         expected = default_profile(game_key).to_dict()
+        missing_fields: list[str] = []
         for key, default in expected.items():
             if key not in profile:
                 profile[key] = deepcopy(default)
                 changed = True
-                issues.append(
-                    ValidationIssue(
-                        f"{path}.{key}",
-                        "warning",
-                        "added missing profile field",
-                        True,
-                        default,
-                    )
+                missing_fields.append(key)
+        if missing_fields:
+            issues.append(
+                ValidationIssue(
+                    path,
+                    "warning",
+                    "added missing profile fields: " + ", ".join(missing_fields),
+                    True,
                 )
+            )
         if profile.get("id") != profile_id:
             profile["id"] = profile_id
             changed = True
@@ -400,6 +432,42 @@ class ConfigValidator:
                         f"{path}.{key}", "error", f"{key} must be true or false"
                     )
                 )
+        for key in cls.PROFILE_INTEGERS:
+            value = profile.get(key)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                issues.append(
+                    ValidationIssue(
+                        f"{path}.{key}",
+                        "error",
+                        f"{key} must be a non-negative integer",
+                    )
+                )
+        allowed_values = {
+            "dxvk_hud": {"off", "fps", "1", "full"},
+            "gamescope_window_mode": {"borderless", "fullscreen", "windowed"},
+            "gamescope_scaler": {"auto", "integer", "fit", "fill", "stretch"},
+            "gamescope_filter": {"linear", "nearest", "fsr", "nis", "pixel"},
+        }
+        for key, allowed in allowed_values.items():
+            if profile.get(key) not in allowed:
+                issues.append(
+                    ValidationIssue(
+                        f"{path}.{key}",
+                        "error",
+                        f"{key} must be one of: {', '.join(sorted(allowed))}",
+                    )
+                )
+        if (
+            isinstance(profile.get("gamescope_sharpness"), int)
+            and not 0 <= profile["gamescope_sharpness"] <= 20
+        ):
+            issues.append(
+                ValidationIssue(
+                    f"{path}.gamescope_sharpness",
+                    "error",
+                    "gamescope_sharpness must be between 0 and 20",
+                )
+            )
         delay = profile.get("followup_delay")
         if not isinstance(delay, int | float) or isinstance(delay, bool):
             issues.append(

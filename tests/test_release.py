@@ -23,7 +23,7 @@ from proton_launcher.proton import (
     resolve_proton_choice,
 )
 from proton_launcher.runner import parse_environment_text
-from proton_launcher.sessions import SessionKind, SessionManager
+from proton_launcher.sessions import SessionKind, SessionManager, SessionRecord
 
 
 class ReleaseTests(unittest.TestCase):
@@ -161,6 +161,31 @@ class ReleaseTests(unittest.TestCase):
                     break
                 time.sleep(0.05)
             self.assertFalse(manager.is_active(record))
+
+    def test_finished_sessions_are_not_polled_again(self):
+        environment = {
+            "XDG_STATE_HOME": str(self.tmp / "state"),
+            "XDG_RUNTIME_DIR": str(self.tmp / "runtime"),
+        }
+        with (
+            patch.dict(os.environ, environment),
+            patch.object(SessionManager, "_detect_systemd", return_value=True),
+        ):
+            manager = SessionManager()
+            record = SessionRecord(
+                "finished-session",
+                SessionKind.PRIMARY.value,
+                "game",
+                "Game",
+                str(self.tmp / "prefix"),
+                "systemd",
+                unit="proton-launcher-finished.service",
+                phase="finished",
+            )
+            manager._write_record(record)
+            with patch.object(manager, "is_active") as is_active:
+                self.assertEqual(manager.active(), [])
+            is_active.assert_not_called()
 
     def test_background_followup_watcher_runs_without_gui(self):
         environment = {

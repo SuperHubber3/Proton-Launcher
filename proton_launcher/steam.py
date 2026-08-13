@@ -7,7 +7,7 @@ from typing import Any
 
 import vdf
 
-from .models import DiscoveryIssue, GameEntry, GameSource
+from .models import DiscoveryIssue, GameEntry, GameSource, SteamLaunchOption
 from .util import expanded_path, unquote_path
 
 DEFAULT_STEAM_ROOTS = ("~/.local/share/Steam", "~/.steam/steam")
@@ -67,7 +67,10 @@ def is_component(app_id: int, name: str, install_dir: str) -> bool:
 
 
 def parse_manifest(
-    path: Path, steam_root: Path, library: Path, launch_executable: str = ""
+    path: Path,
+    steam_root: Path,
+    library: Path,
+    launch_options: list[SteamLaunchOption] | None = None,
 ) -> GameEntry | None:
     app = _text_vdf(path).get("AppState", {})
     app_id = int(app["appid"])
@@ -75,8 +78,27 @@ def parse_manifest(
     if is_component(app_id, name, install_dir):
         return None
     installed = library / "steamapps" / "common" / install_dir if install_dir else None
+    resolved_options: list[SteamLaunchOption] = []
+    if installed:
+        for option in launch_options or []:
+            executable = _resolve_install_file(installed, option.executable)
+            if not executable:
+                continue
+            working_directory = _resolve_install_path(
+                installed, option.working_directory
+            )
+            resolved_options.append(
+                SteamLaunchOption(
+                    option.label.strip() or f"Play {name.strip()}",
+                    executable,
+                    option.arguments,
+                    working_directory,
+                )
+            )
     default_executable = (
-        resolve_game_executable(installed, launch_executable) if installed else ""
+        resolved_options[0].executable
+        if resolved_options
+        else (resolve_game_executable(installed) if installed else "")
     )
     return GameEntry(
         GameSource.STEAM,
@@ -86,12 +108,101 @@ def parse_manifest(
         library,
         installed,
         default_executable=default_executable,
+        launch_options=tuple(resolved_options),
     )
 
 
-def parse_appinfo_launches(path: Path, wanted_app_ids: set[int]) -> dict[int, str]:
-    """Read default Windows launch executables from Steam appinfo V29."""
-    result: dict[int, str] = {}
+def _read_exact(handle, size: int) -> bytes:
+    value = handle.read(size)
+    if len(value) != size:
+        raise ValueError("Truncated binary VDF value")
+    return value
+
+
+def _read_cstring(handle, wide: bool = False) -> str:
+    terminator = b"\0\0" if wide else b"\0"
+    value = bytearray()
+    unit = 2 if wide else 1
+    while True:
+        part = _read_exact(handle, unit)
+        if part == terminator:
+            return value.decode("utf-16-le" if wide else "utf-8", errors="replace")
+        value.extend(part)
+
+
+def _load_key_table_vdf(handle, keys: list[str]) -> dict[str, Any]:
+    """Decode the key-indexed binary VDF used by current appinfo files."""
+    containers: list[dict[str, Any]] = [{}]
+    while True:
+        value_type = _read_exact(handle, 1)[0]
+        if value_type == 8:
+            if len(containers) == 1:
+                return containers[0]
+            containers.pop()
+            continue
+        key_index = struct.unpack("<i", _read_exact(handle, 4))[0]
+        if not 0 <= key_index < len(keys):
+            raise ValueError(f"Invalid appinfo key index {key_index}")
+        key = keys[key_index]
+        if value_type == 0:
+            child: dict[str, Any] = {}
+            containers[-1][key] = child
+            containers.append(child)
+        elif value_type == 1:
+            containers[-1][key] = _read_cstring(handle)
+        elif value_type == 2:
+            containers[-1][key] = struct.unpack("<i", _read_exact(handle, 4))[0]
+        elif value_type == 3:
+            containers[-1][key] = struct.unpack("<f", _read_exact(handle, 4))[0]
+        elif value_type in {4, 6}:
+            containers[-1][key] = struct.unpack("<I", _read_exact(handle, 4))[0]
+        elif value_type == 5:
+            containers[-1][key] = _read_cstring(handle, wide=True)
+        elif value_type == 7:
+            containers[-1][key] = struct.unpack("<Q", _read_exact(handle, 8))[0]
+        elif value_type == 10:
+            containers[-1][key] = struct.unpack("<q", _read_exact(handle, 8))[0]
+        else:
+            raise ValueError(f"Unsupported binary VDF type {value_type}")
+
+
+def _windows_launch_options(data: dict[str, Any]) -> list[SteamLaunchOption]:
+    launches = data.get("config", {}).get("launch", {})
+    result: list[SteamLaunchOption] = []
+    if not isinstance(launches, dict):
+        return result
+    for launch in launches.values():
+        if not isinstance(launch, dict):
+            continue
+        config = launch.get("config", {})
+        config = config if isinstance(config, dict) else {}
+        oslist = str(config.get("oslist", "")).strip().casefold()
+        executable = str(launch.get("executable", "")).strip()
+        if not executable or (oslist and "windows" not in oslist):
+            continue
+        if str(launch.get("type", "default")).casefold() == "none":
+            continue
+        description = str(launch.get("description", "")).strip()
+        if not description:
+            localized = launch.get("description_loc", {})
+            if isinstance(localized, dict):
+                description = str(localized.get("english", "")).strip()
+        result.append(
+            SteamLaunchOption(
+                description,
+                executable,
+                str(launch.get("arguments", "")),
+                str(launch.get("workingdir", "")),
+            )
+        )
+    return result
+
+
+def parse_appinfo_launches(
+    path: Path, wanted_app_ids: set[int]
+) -> dict[int, list[SteamLaunchOption]]:
+    """Read Windows launch choices from Steam appinfo V29."""
+    result: dict[int, list[SteamLaunchOption]] = {}
     if not wanted_app_ids or not path.is_file():
         return result
     file_size = path.stat().st_size
@@ -137,28 +248,50 @@ def parse_appinfo_launches(path: Path, wanted_app_ids: set[int]) -> dict[int, st
                 raise ValueError(f"Invalid appinfo record size for app {app_id}")
             if app_id in wanted_app_ids:
                 handle.seek(start + 68)
-                data = vdf.binary_load(handle, key_table=keys).get("appinfo", {})
-                launches = data.get("config", {}).get("launch", {})
-                for launch in launches.values():
-                    config = (
-                        launch.get("config", {}) if isinstance(launch, dict) else {}
-                    )
-                    oslist = str(config.get("oslist", "windows")).casefold()
-                    launch_type = (
-                        str(launch.get("type", "default")).casefold()
-                        if isinstance(launch, dict)
-                        else ""
-                    )
-                    executable = (
-                        str(launch.get("executable", ""))
-                        if isinstance(launch, dict)
-                        else ""
-                    )
-                    if executable and "windows" in oslist and launch_type != "none":
-                        result[app_id] = executable
-                        break
+                data = _load_key_table_vdf(handle, keys).get("appinfo", {})
+                options = _windows_launch_options(data)
+                if options:
+                    result[app_id] = options
             handle.seek(end)
     return result
+
+
+def _resolve_install_path(install_dir: Path, value: str) -> str:
+    value = value.strip().strip('"')
+    if not value:
+        return ""
+    normalized = value.replace("%INSTALLDIR%", "").lstrip("/\\")
+    path = _case_insensitive_path(install_dir, normalized)
+    return str(path) if path.is_dir() else ""
+
+
+def _resolve_install_file(install_dir: Path, value: str) -> str:
+    value = value.strip().strip('"')
+    if not value:
+        return ""
+    path = _case_insensitive_path(install_dir, value.lstrip("/\\"))
+    return str(path) if path.is_file() else ""
+
+
+def _case_insensitive_path(root: Path, relative: str) -> Path:
+    current = root
+    for part in relative.replace("\\", "/").split("/"):
+        if not part or part == ".":
+            continue
+        direct = current / part
+        if direct.exists():
+            current = direct
+            continue
+        try:
+            match = next(
+                child
+                for child in current.iterdir()
+                if child.name.casefold() == part.casefold()
+            )
+        except (OSError, StopIteration):
+            return direct
+        current = match
+    return current
 
 
 def resolve_game_executable(install_dir: Path, steam_executable: str = "") -> str:
@@ -250,7 +383,7 @@ def discover_games(
             if manifest.stem.removeprefix("appmanifest_").isdigit()
         }
         try:
-            launch_executables = parse_appinfo_launches(
+            launch_options = parse_appinfo_launches(
                 root / "appcache" / "appinfo.vdf", app_ids
             )
         except (
@@ -261,7 +394,7 @@ def discover_games(
             SyntaxError,
             IndexError,
         ) as exc:
-            launch_executables = {}
+            launch_options = {}
             issues.append(
                 DiscoveryIssue(
                     root / "appcache" / "appinfo.vdf",
@@ -273,7 +406,7 @@ def discover_games(
                 try:
                     manifest_id = int(manifest.stem.removeprefix("appmanifest_"))
                     game = parse_manifest(
-                        manifest, root, library, launch_executables.get(manifest_id, "")
+                        manifest, root, library, launch_options.get(manifest_id)
                     )
                     if game and game.key not in seen:
                         games.append(game)

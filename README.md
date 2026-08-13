@@ -13,6 +13,8 @@ Steam overlay, or launch a second program after the game starts.
 
 - Finds Steam games in every detected library and filters runtimes,
   redistributables, and Proton packages from the list.
+- Reads Steam's named launch options and lets you choose the game, launcher, or
+  configuration tool before a direct launch.
 - Reads non-Steam shortcuts from each Steam user's `shortcuts.vdf`.
 - Shows ProtonDB ratings for Steam games and non-Steam shortcuts with a local
   Steam App ID.
@@ -24,6 +26,8 @@ Steam overlay, or launch a second program after the game starts.
   directories.
 - Supports Wine administrator launches, Steam launches, direct Steam overlay
   injection, online-fix overrides, WeMod, and delayed follow-ups.
+- Adds per-profile GameMode, MangoHud, Gamescope, native Wayland, GPU, input,
+  HDR, and compatibility switches to direct launches.
 - Keeps game and follow-up sessions available after the window closes, with
   separate Stop controls and an optional system tray.
 - Lets you open, replace, or delete a prefix from the toolbar.
@@ -35,6 +39,9 @@ Steam overlay, or launch a second program after the game starts.
 - [PySide6](https://pypi.org/project/PySide6/) 6.7 or newer
 - [vdf](https://pypi.org/project/vdf/) 3.4 or newer
 - At least one Proton installation
+
+GameMode, MangoHud, and Gamescope are optional. Their toggles are disabled when
+the matching host command is not installed.
 
 A running systemd user manager is recommended. Proton Launcher uses transient
 user services to track the full process tree when they are available. It falls
@@ -78,6 +85,12 @@ that choice.
 ## Launch options
 
 ### Executables and commands
+
+Steam games with multiple Windows launch entries show a **Steam launch option**
+selector above the executable path. Choosing an entry fills its executable,
+arguments, and working directory. Editing those fields switches the selector to
+**Custom executable**. This controls direct launches; **Launch through Steam**
+still leaves the choice to Steam.
 
 Executable mode runs:
 
@@ -123,6 +136,33 @@ because the values do not pass through a shell.
 **Run as administrator** uses Wine's Windows `runas` behavior. It does not run
 the game or Proton Launcher as Linux root. The bundled x86-64 helper can also
 start 32-bit Windows games in a normal Proton WoW64 prefix.
+
+### GameMode, MangoHud, Gamescope, and Wayland
+
+The **Launch options** row applies to direct launches and is saved with the
+profile:
+
+- **GameMode** runs the game through `gamemoderun`.
+- **MangoHud** wraps the Proton command. With Gamescope enabled, the launcher
+  uses Gamescope's `--mangoapp` integration instead.
+- **Gamescope** provides window mode, game and output resolutions, refresh and
+  FPS limits, scaling, FSR/NIS filters, sharpness, adaptive sync, HDR, and an
+  extra-arguments field under **Configure**.
+- **Native Wayland** enables Proton's Wine-Wayland driver. Support depends on
+  the selected Proton build. The Steam overlay and Steam Input may not work on
+  this display path.
+
+**Configure** also contains discrete-GPU preference, HDR, forced NVAPI, raw
+Wayland mouse input, SDL controller input, and DXVK HUD presets. The
+troubleshooting tab can disable Esync or Fsync, replace DXVK with WineD3D,
+write a Proton log, force large-address-aware mode, or set Wine debug channels.
+These settings are left off by default because they fix specific compatibility
+problems rather than improve every game.
+
+HDR enables native Wayland as well as Proton and Gamescope HDR flags. Discrete
+GPU preference runs the command through `switcherooctl`, which selects the
+system's first discrete GPU. Custom environment entries still apply; an
+enabled toggle takes precedence when both set the same variable.
 
 ## Steam and overlay options
 

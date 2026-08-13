@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -51,7 +52,13 @@ from .proton import (
     read_prefix_metadata,
     resolve_proton_choice,
 )
-from .protondb import game_url, parse_rating, protondb_app_id, summary_url
+from .protondb import (
+    ProtonDBCache,
+    game_url,
+    parse_rating,
+    protondb_app_id,
+    summary_url,
+)
 from .runner import (
     build_followup_launch_spec,
     build_launch_spec,
@@ -61,12 +68,39 @@ from .runner import (
     parse_environment_text,
     prepare_compatdata_directory,
 )
+from .runtime_options_dialog import RuntimeOptionsDialog
 from .sessions import SessionKind, SessionManager, SessionRecord
 from .settings_dialog import SettingsDialog
 from .steam import discover_games, discover_libraries, discover_steam_roots
 from .wemod_bridge import reset_wemod_prefix
 
 APP_ICON = Path(__file__).resolve().parent.parent / "assets" / "proton-launcher.svg"
+RUNTIME_OPTION_FIELDS = (
+    "prefer_discrete_gpu",
+    "enable_hdr",
+    "force_nvapi",
+    "enable_wayland_raw_input",
+    "prefer_sdl_input",
+    "dxvk_hud",
+    "gamescope_window_mode",
+    "gamescope_game_width",
+    "gamescope_game_height",
+    "gamescope_output_width",
+    "gamescope_output_height",
+    "gamescope_refresh_rate",
+    "gamescope_fps_limit",
+    "gamescope_scaler",
+    "gamescope_filter",
+    "gamescope_sharpness",
+    "gamescope_adaptive_sync",
+    "gamescope_extra_arguments",
+    "disable_esync",
+    "disable_fsync",
+    "use_wined3d",
+    "enable_proton_log",
+    "force_large_address_aware",
+    "wine_debug",
+)
 
 
 class MainWindow(QMainWindow):
@@ -91,10 +125,16 @@ class MainWindow(QMainWindow):
         self.named_profile_dirty = False
         self.session_records: dict[str, SessionRecord] = {}
         self.log_offsets: dict[str, int] = {}
-        self.protondb_cache: dict[int, str | None] = {}
+        self.active_session_signature: tuple[tuple[str, str, str], ...] = ()
+        self.protondb_cache = ProtonDBCache()
         self.protondb_app_ids: dict[str, int | None] = {}
         self.protondb_pending: set[int] = set()
         self.current_protondb_app_id: int | None = None
+        self.selecting_launch_option = False
+        blank_profile = LaunchProfile("", "", "")
+        self.runtime_option_values = {
+            field: getattr(blank_profile, field) for field in RUNTIME_OPTION_FIELDS
+        }
         self._force_quit = False
 
         self.protondb_network = QNetworkAccessManager(self)
@@ -218,12 +258,44 @@ class MainWindow(QMainWindow):
         overlay_row.addStretch()
         form.addRow("", overlay_row)
 
+        runtime_row = QHBoxLayout()
+        self.gamemode_checkbox = QCheckBox("GameMode")
+        self.mangohud_checkbox = QCheckBox("MangoHud")
+        self.gamescope_checkbox = QCheckBox("Gamescope")
+        self.wayland_checkbox = QCheckBox("Native Wayland")
+        for widget, program in (
+            (self.gamemode_checkbox, "gamemoderun"),
+            (self.mangohud_checkbox, "mangohud"),
+            (self.gamescope_checkbox, "gamescope"),
+        ):
+            available = shutil.which(program)
+            widget.setEnabled(bool(available))
+            if not available:
+                widget.setToolTip(f"{program} is not installed")
+            runtime_row.addWidget(widget)
+        self.wayland_checkbox.setToolTip(
+            "Experimental Proton/GE-Proton Wine-Wayland driver; Steam overlay may not work"
+        )
+        runtime_row.addWidget(self.wayland_checkbox)
+        self.runtime_options_button = QPushButton("Configure…")
+        self.runtime_options_button.clicked.connect(self.configure_runtime_options)
+        runtime_row.addWidget(self.runtime_options_button)
+        runtime_row.addStretch()
+        form.addRow("Launch options", runtime_row)
+
         self.tabs = QTabWidget()
         self.tabs.currentChanged.connect(self._mode_changed)
         executable_tab = QWidget()
         executable_form = QFormLayout(executable_tab)
+        self.launch_option_combo = QComboBox()
+        self.launch_option_combo.currentIndexChanged.connect(
+            self._launch_option_changed
+        )
+        self.launch_option_label = QLabel("Steam launch option")
+        executable_form.addRow(self.launch_option_label, self.launch_option_combo)
         self.exe_edit = QLineEdit()
         self.exe_edit.textChanged.connect(self._update_wait_target)
+        self.exe_edit.textChanged.connect(self._sync_launch_option)
         exe_row = QHBoxLayout()
         exe_row.addWidget(self.exe_edit, 1)
         browse = QPushButton("Browse…")
@@ -258,10 +330,12 @@ class MainWindow(QMainWindow):
         details = QWidget()
         details_form = QFormLayout(details)
         self.arguments_edit = QLineEdit()
+        self.arguments_edit.textChanged.connect(self._sync_launch_option)
         self.arguments_edit.setPlaceholderText(
             'Arguments, e.g. --flag "value with spaces"'
         )
         self.working_edit = QLineEdit()
+        self.working_edit.textChanged.connect(self._sync_launch_option)
         work_row = QHBoxLayout()
         work_row.addWidget(self.working_edit, 1)
         work_browse = QPushButton("Browse…")
@@ -299,6 +373,7 @@ class MainWindow(QMainWindow):
         self.followup_group = QGroupBox("Follow-up launch")
         self.followup_group.setCheckable(True)
         self.followup_group.setChecked(False)
+        self.followup_group.toggled.connect(self._update_followup_launch_button)
         followup_form = QFormLayout(self.followup_group)
         self.wait_exe_edit = QLineEdit()
         self.wait_exe_edit.setPlaceholderText("Process name, e.g. Game.exe")
@@ -438,6 +513,10 @@ class MainWindow(QMainWindow):
             self.overlay_checkbox,
             self.online_fix_checkbox,
             self.wemod_checkbox,
+            self.gamemode_checkbox,
+            self.mangohud_checkbox,
+            self.gamescope_checkbox,
+            self.wayland_checkbox,
             self.followup_group,
             self.wait_primary_checkbox,
             self.followup_admin_checkbox,
@@ -513,16 +592,22 @@ class MainWindow(QMainWindow):
             return
 
         self.protondb_button.setEnabled(True)
-        rating = self.protondb_cache.get(app_id)
-        if app_id in self.protondb_cache:
+        cached, rating, fresh = self.protondb_cache.lookup(app_id)
+        if cached:
             self.protondb_button.setText(f"ProtonDB: {rating or 'Unrated'}")
-            self.protondb_button.setToolTip("Click to open this game's ProtonDB page.")
-            return
+            self.protondb_button.setToolTip(
+                "Click to open this game's ProtonDB page."
+                if fresh
+                else "Showing a cached rating while ProtonDB is refreshed."
+            )
+            if fresh:
+                return
 
-        self.protondb_button.setText("ProtonDB: Loading…")
-        self.protondb_button.setToolTip(
-            "Loading the ProtonDB rating. Click to open the game page."
-        )
+        if not cached:
+            self.protondb_button.setText("ProtonDB: Loading…")
+            self.protondb_button.setToolTip(
+                "Loading the ProtonDB rating. Click to open the game page."
+            )
         if app_id in self.protondb_pending:
             return
         self.protondb_pending.add(app_id)
@@ -541,19 +626,26 @@ class MainWindow(QMainWindow):
         error = reply.error()
         status = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
         if error == QNetworkReply.NoError:
-            self.protondb_cache[app_id] = parse_rating(bytes(reply.readAll()))
+            self.protondb_cache.put(app_id, parse_rating(bytes(reply.readAll())))
         elif status == 404:
-            self.protondb_cache[app_id] = None
+            self.protondb_cache.put(app_id, None)
         reply.deleteLater()
 
         game = self.current_game()
         if not game or self.current_protondb_app_id != app_id:
             return
         if error != QNetworkReply.NoError and status != 404:
-            self.protondb_button.setText("ProtonDB: Offline")
-            self.protondb_button.setToolTip(
-                "The rating could not be loaded. Click to open the game page."
-            )
+            cached, rating, _fresh = self.protondb_cache.lookup(app_id)
+            if cached:
+                self.protondb_button.setText(f"ProtonDB: {rating or 'Unrated'}")
+                self.protondb_button.setToolTip(
+                    "Showing a cached rating because ProtonDB could not be reached."
+                )
+            else:
+                self.protondb_button.setText("ProtonDB: Offline")
+                self.protondb_button.setToolTip(
+                    "The rating could not be loaded. Click to open the game page."
+                )
             return
         self._update_protondb_rating(game)
 
@@ -709,6 +801,13 @@ class MainWindow(QMainWindow):
         self.overlay_app_id_edit.setText(profile.overlay_app_id)
         self.online_fix_checkbox.setChecked(profile.apply_online_fix)
         self.wemod_checkbox.setChecked(profile.launch_wemod)
+        self.gamemode_checkbox.setChecked(profile.enable_gamemode)
+        self.mangohud_checkbox.setChecked(profile.enable_mangohud)
+        self.gamescope_checkbox.setChecked(profile.enable_gamescope)
+        self.wayland_checkbox.setChecked(profile.enable_wayland or profile.enable_hdr)
+        self.runtime_option_values = {
+            field: getattr(profile, field) for field in RUNTIME_OPTION_FIELDS
+        }
         self.followup_group.setChecked(profile.followup_enabled)
         self.wait_exe_edit.setText(profile.wait_for_executable)
         self.wait_primary_checkbox.setChecked(profile.wait_for_primary_executable)
@@ -723,6 +822,7 @@ class MainWindow(QMainWindow):
         )
         self.followup_arguments_edit.setText(profile.followup_arguments)
         self.followup_admin_checkbox.setChecked(profile.followup_run_as_admin)
+        self._populate_launch_options(profile)
         self._populate_proton_combo(profile)
         self.loading_profile = False
         self.named_profile_dirty = False
@@ -730,6 +830,92 @@ class MainWindow(QMainWindow):
         self._steam_launch_mode_changed()
         self._followup_mode_changed()
         self._wemod_mode_changed()
+
+    def _populate_launch_options(self, profile: LaunchProfile) -> None:
+        game = self.current_game()
+        options = game.launch_options if game else ()
+        self.launch_option_combo.blockSignals(True)
+        self.launch_option_combo.clear()
+        for index, option in enumerate(options):
+            self.launch_option_combo.addItem(option.label, index)
+            tooltip = "\n".join(
+                value for value in (option.executable, option.arguments) if value
+            )
+            self.launch_option_combo.setItemData(index, tooltip, Qt.ToolTipRole)
+        if options:
+            self.launch_option_combo.addItem("Custom executable", None)
+        visible = len(options) > 1
+        self.launch_option_label.setVisible(visible)
+        self.launch_option_combo.setVisible(visible)
+
+        selected = self._matching_launch_option(
+            profile.executable,
+            profile.arguments,
+            profile.working_directory,
+        )
+        if selected is None and not profile.executable.strip() and options:
+            selected = 0
+            option = options[0]
+            self.exe_edit.setText(option.executable)
+            self.arguments_edit.setText(option.arguments)
+            self.working_edit.setText(option.working_directory)
+        self.launch_option_combo.setCurrentIndex(
+            selected if selected is not None else self.launch_option_combo.count() - 1
+        )
+        self.launch_option_combo.blockSignals(False)
+
+    def _matching_launch_option(
+        self, executable: str, arguments: str, working_directory: str
+    ) -> int | None:
+        game = self.current_game()
+        if not game or not executable.strip():
+            return None
+        executable_path = Path(executable).expanduser().resolve(strict=False)
+        for index, option in enumerate(game.launch_options):
+            if Path(option.executable).resolve(strict=False) != executable_path:
+                continue
+            if option.arguments.strip() != arguments.strip():
+                continue
+            if option.working_directory and (
+                Path(option.working_directory).resolve(strict=False)
+                != Path(working_directory).expanduser().resolve(strict=False)
+            ):
+                continue
+            return index
+        return None
+
+    def _sync_launch_option(self, *_args) -> None:
+        if self.loading_profile or self.selecting_launch_option:
+            return
+        game = self.current_game()
+        if not game or not game.launch_options:
+            return
+        selected = self._matching_launch_option(
+            self.exe_edit.text(),
+            self.arguments_edit.text(),
+            self.working_edit.text(),
+        )
+        self.launch_option_combo.blockSignals(True)
+        self.launch_option_combo.setCurrentIndex(
+            selected if selected is not None else self.launch_option_combo.count() - 1
+        )
+        self.launch_option_combo.blockSignals(False)
+
+    def _launch_option_changed(self, index: int) -> None:
+        game = self.current_game()
+        option_index = self.launch_option_combo.itemData(index)
+        if self.loading_profile or not game or option_index is None:
+            return
+        if not 0 <= option_index < len(game.launch_options):
+            return
+        option = game.launch_options[option_index]
+        self.selecting_launch_option = True
+        try:
+            self.exe_edit.setText(option.executable)
+            self.arguments_edit.setText(option.arguments)
+            self.working_edit.setText(option.working_directory)
+        finally:
+            self.selecting_launch_option = False
 
     def _populate_proton_combo(self, profile: LaunchProfile) -> None:
         self.proton_combo.blockSignals(True)
@@ -775,6 +961,11 @@ class MainWindow(QMainWindow):
             overlay_app_id=self.overlay_app_id_edit.text().strip(),
             apply_online_fix=self.online_fix_checkbox.isChecked(),
             launch_wemod=self.wemod_checkbox.isChecked(),
+            enable_gamemode=self.gamemode_checkbox.isChecked(),
+            enable_mangohud=self.mangohud_checkbox.isChecked(),
+            enable_gamescope=self.gamescope_checkbox.isChecked(),
+            enable_wayland=self.wayland_checkbox.isChecked(),
+            **self.runtime_option_values,
             followup_enabled=self.followup_group.isChecked(),
             wait_for_executable=self.wait_exe_edit.text().strip(),
             wait_for_primary_executable=self.wait_primary_checkbox.isChecked(),
@@ -1038,11 +1229,27 @@ class MainWindow(QMainWindow):
         for record in active:
             self._register_session(record)
         self._tail_session_logs()
+        active_ids = {record.id for record in active}
+        self.session_records = {
+            record_id: record
+            for record_id, record in self.session_records.items()
+            if record_id in active_ids
+        }
+        self.log_offsets = {
+            record_id: offset
+            for record_id, offset in self.log_offsets.items()
+            if record_id in active_ids
+        }
+        signature = tuple((record.id, record.kind, record.phase) for record in active)
+        if signature == self.active_session_signature:
+            return
+        was_active = bool(self.active_session_signature)
+        self.active_session_signature = signature
         self._update_session_buttons(active)
         if active:
             labels = [f"{item.kind}: {item.phase}" for item in active]
             self.status.setText(" • ".join(labels))
-        elif self.session_records:
+        elif was_active:
             self.status.setText("Sessions finished")
             self._update_prefix_badge()
 
@@ -1093,6 +1300,13 @@ class MainWindow(QMainWindow):
         self.followup_launch_now_button.setEnabled(
             self.followup_group.isChecked() and not followup
         )
+
+    def _update_followup_launch_button(self, checked: bool) -> None:
+        followup = any(
+            kind == SessionKind.FOLLOWUP.value
+            for _session_id, kind, _phase in self.active_session_signature
+        )
+        self.followup_launch_now_button.setEnabled(checked and not followup)
 
     def stop_game(self) -> None:
         primary = self.sessions.records(SessionKind.PRIMARY)
@@ -1373,6 +1587,23 @@ class MainWindow(QMainWindow):
         if path:
             self.followup_target_edit.setText(path)
 
+    def configure_runtime_options(self) -> None:
+        try:
+            profile = self._profile_from_ui()
+        except ValueError as error:
+            QMessageBox.warning(self, "Cannot configure launch options", str(error))
+            return
+        dialog = RuntimeOptionsDialog(profile, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        values = dialog.values()
+        self.runtime_option_values.update(
+            {field: values[field] for field in RUNTIME_OPTION_FIELDS if field in values}
+        )
+        if self.runtime_option_values["enable_hdr"]:
+            self.wayland_checkbox.setChecked(True)
+        self._field_changed()
+
     def _online_fix_toggled(self, checked: bool) -> None:
         if self.loading_profile:
             return
@@ -1382,6 +1613,16 @@ class MainWindow(QMainWindow):
     def _steam_launch_mode_changed(self, *_args) -> None:
         direct = not self.steam_launch_checkbox.isChecked()
         self.overlay_checkbox.setEnabled(direct)
+        for widget, program in (
+            (self.gamemode_checkbox, "gamemoderun"),
+            (self.mangohud_checkbox, "mangohud"),
+            (self.gamescope_checkbox, "gamescope"),
+        ):
+            widget.setEnabled(
+                direct and (bool(shutil.which(program)) or widget.isChecked())
+            )
+        self.wayland_checkbox.setEnabled(direct)
+        self.runtime_options_button.setEnabled(direct)
         self._overlay_mode_changed()
         self._wemod_mode_changed()
 

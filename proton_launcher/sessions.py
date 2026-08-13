@@ -79,6 +79,7 @@ class SessionManager:
         for directory in (self.records_dir, self.logs_dir, self.runtime_dir):
             directory.mkdir(parents=True, exist_ok=True)
         self._children: dict[str, subprocess.Popen] = {}
+        self._finished_records: set[Path] = set()
         self.systemd_available = self._detect_systemd()
         self.cleanup_old_records()
 
@@ -205,15 +206,21 @@ class SessionManager:
     def active(self) -> list[SessionRecord]:
         result: list[SessionRecord] = []
         for path in self.records_dir.glob("*.json"):
+            if path in self._finished_records:
+                continue
             try:
                 record = SessionRecord.from_dict(json.loads(path.read_text()))
             except (OSError, ValueError, TypeError):
                 continue
+            if record.phase == "finished":
+                self._finished_records.add(path)
+                continue
             if self.is_active(record):
                 result.append(record)
-            elif record.phase != "finished":
+            else:
                 record.phase = "finished"
                 self._write_record(record)
+                self._finished_records.add(path)
         return sorted(result, key=lambda item: item.id)
 
     def is_active(self, record: SessionRecord) -> bool:
@@ -313,7 +320,11 @@ class SessionManager:
         for path in self.records_dir.glob("*.json"):
             try:
                 record = SessionRecord.from_dict(json.loads(path.read_text()))
-                if path.stat().st_mtime >= cutoff or self.is_active(record):
+                if path.stat().st_mtime >= cutoff:
+                    if record.phase == "finished":
+                        self._finished_records.add(path)
+                    continue
+                if record.phase != "finished" and self.is_active(record):
                     continue
                 path.unlink()
                 Path(record.log_path).unlink(missing_ok=True)

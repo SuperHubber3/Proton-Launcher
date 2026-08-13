@@ -5,12 +5,13 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication,
+    QDialog,
     QMessageBox,
     QPushButton,
     QToolBar,
@@ -20,6 +21,7 @@ from proton_launcher.models import (
     GameEntry,
     GameSource,
     ProtonInstallation,
+    SteamLaunchOption,
 )  # noqa: E402
 from proton_launcher.profiles import ConfigStore  # noqa: E402
 from proton_launcher.protondb import protondb_app_id  # noqa: E402
@@ -41,6 +43,7 @@ class UiTests(unittest.TestCase):
                 "HOME": str(self.tmp),
                 "XDG_STATE_HOME": str(self.tmp / "state"),
                 "XDG_RUNTIME_DIR": str(self.tmp / "runtime"),
+                "XDG_CACHE_HOME": str(self.tmp / "cache"),
             },
         )
         self.environment.start()
@@ -115,6 +118,101 @@ class UiTests(unittest.TestCase):
         self.assertFalse(self.window.delete_button.isEnabled())
         self.assertEqual(self.window.protondb_button.text(), "ProtonDB")
         self.assertFalse(self.window.protondb_button.isEnabled())
+
+    def test_runtime_options_round_trip_through_profile_editor(self):
+        self.window.gamemode_checkbox.setChecked(True)
+        self.window.mangohud_checkbox.setChecked(True)
+        self.window.gamescope_checkbox.setChecked(True)
+        self.window.wayland_checkbox.setChecked(True)
+        self.window.runtime_option_values.update(
+            {
+                "prefer_discrete_gpu": True,
+                "gamescope_fps_limit": 72,
+                "gamescope_filter": "fsr",
+                "wine_debug": "+seh",
+            }
+        )
+
+        profile = self.window._profile_from_ui()
+        self.assertTrue(profile.enable_gamemode)
+        self.assertTrue(profile.enable_mangohud)
+        self.assertTrue(profile.enable_gamescope)
+        self.assertTrue(profile.enable_wayland)
+        self.assertTrue(profile.prefer_discrete_gpu)
+        self.assertEqual(profile.gamescope_fps_limit, 72)
+        self.assertEqual(profile.gamescope_filter, "fsr")
+        self.assertEqual(profile.wine_debug, "+seh")
+
+        self.window.load_profile(profile)
+        self.assertTrue(self.window.gamemode_checkbox.isChecked())
+        self.assertEqual(self.window.runtime_option_values["gamescope_fps_limit"], 72)
+
+    def test_runtime_dialog_ignores_unknown_and_quick_toggle_values(self):
+        dialog = MagicMock()
+        dialog.exec.return_value = QDialog.Accepted
+        dialog.values.return_value = {
+            "prefer_discrete_gpu": True,
+            "enable_gamemode": False,
+            "unknown_option": "ignored",
+        }
+        self.window.gamemode_checkbox.setChecked(True)
+
+        with patch("proton_launcher.ui.RuntimeOptionsDialog", return_value=dialog):
+            self.window.configure_runtime_options()
+
+        self.assertTrue(self.window.runtime_option_values["prefer_discrete_gpu"])
+        self.assertNotIn("enable_gamemode", self.window.runtime_option_values)
+        self.assertNotIn("unknown_option", self.window.runtime_option_values)
+        self.assertTrue(self.window._profile_from_ui().enable_gamemode)
+
+    def test_followup_launch_button_tracks_group_without_session_change(self):
+        self.assertFalse(self.window.followup_launch_now_button.isEnabled())
+
+        self.window.followup_group.setChecked(True)
+        self.assertTrue(self.window.followup_launch_now_button.isEnabled())
+
+        self.window.followup_group.setChecked(False)
+        self.assertFalse(self.window.followup_launch_now_button.isEnabled())
+
+    def test_steam_launch_option_updates_direct_launch_fields(self):
+        old_game = self.window.current_game()
+        game = GameEntry(
+            GameSource.STEAM,
+            42,
+            "Example",
+            old_game.steam_root,
+            old_game.library_root,
+            launch_options=(
+                SteamLaunchOption("Play game", "/games/Game.exe"),
+                SteamLaunchOption(
+                    "Open launcher",
+                    "/games/Launcher.exe",
+                    "--settings",
+                    "/games",
+                ),
+            ),
+        )
+        self.window.games = [game]
+        self.window.game_combo.clear()
+        self.window.game_combo.addItem(game.label, game.key)
+        self.window.current_profile.game_key = game.key
+        self.window.current_profile.executable = ""
+        self.window.load_profile(self.window.current_profile)
+
+        self.assertFalse(self.window.launch_option_combo.isHidden())
+        self.assertEqual(self.window.launch_option_combo.currentText(), "Play game")
+        self.assertEqual(self.window.exe_edit.text(), "/games/Game.exe")
+
+        self.window.launch_option_combo.setCurrentIndex(1)
+
+        self.assertEqual(self.window.exe_edit.text(), "/games/Launcher.exe")
+        self.assertEqual(self.window.arguments_edit.text(), "--settings")
+        self.assertEqual(self.window.working_edit.text(), "/games")
+
+        self.window.arguments_edit.setText("--custom")
+        self.assertEqual(
+            self.window.launch_option_combo.currentText(), "Custom executable"
+        )
 
     def test_protondb_button_shows_rating_and_opens_game_page(self):
         old_game = self.window.current_game()

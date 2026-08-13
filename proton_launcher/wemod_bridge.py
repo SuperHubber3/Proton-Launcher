@@ -30,6 +30,7 @@ except ImportError:  # Direct execution by runner.py.
 WEMOD_VARIABLE = "PL_WEMOD_WINEDLLOVERRIDES"
 STEAM_LIBRARY_VARIABLE = "PL_WEMOD_STEAM_LIBRARY"
 STEAM_APP_ID_VARIABLE = "PL_WEMOD_STEAM_APP_ID"
+GAME_WRAPPER_VARIABLE = "PL_GAME_WRAPPER_ARGUMENTS"
 STEAM_RETRY_HELPER = (
     Path(__file__).resolve().parent.parent / "helpers" / "steam-retry-helper.exe"
 )
@@ -460,6 +461,17 @@ def main() -> int:
         return 2
 
     game_environment = dict(os.environ)
+    encoded_wrappers = game_environment.pop(GAME_WRAPPER_VARIABLE, "[]")
+    try:
+        game_wrappers = json.loads(encoded_wrappers)
+    except json.JSONDecodeError:
+        print("Invalid game wrapper argument list", file=sys.stderr)
+        return 2
+    if not isinstance(game_wrappers, list) or not all(
+        isinstance(item, str) for item in game_wrappers
+    ):
+        print("Invalid game wrapper argument list", file=sys.stderr)
+        return 2
     prefix = Path(game_environment.get("STEAM_COMPAT_DATA_PATH", ""))
     marker = prefix / "pfx" / ".wemod_installer"
     wemod_overrides = game_environment.pop(WEMOD_VARIABLE, "")
@@ -615,7 +627,7 @@ def main() -> int:
                 cwd=str(Path(wemod_executable).parent),
             )
 
-    game_command = [proton, *game_arguments]
+    game_command = [*game_wrappers, proton, *game_arguments]
     print("Game: $ " + " ".join(game_command), flush=True)
     game = subprocess.Popen(game_command, env=game_environment)
     return_code = game.wait()

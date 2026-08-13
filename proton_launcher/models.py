@@ -17,6 +17,14 @@ class GameSource(str, Enum):
     SHORTCUT = "shortcut"
 
 
+@dataclass(frozen=True, slots=True)
+class SteamLaunchOption:
+    label: str
+    executable: str
+    arguments: str = ""
+    working_directory: str = ""
+
+
 @dataclass(slots=True)
 class GameEntry:
     source: GameSource
@@ -28,6 +36,7 @@ class GameEntry:
     shortcut_exe: str = ""
     shortcut_start_dir: str = ""
     default_executable: str = ""
+    launch_options: tuple[SteamLaunchOption, ...] = ()
 
     @property
     def key(self) -> str:
@@ -87,6 +96,34 @@ class LaunchProfile:
     overlay_app_id: str = ""
     apply_online_fix: bool = False
     launch_wemod: bool = False
+    enable_gamemode: bool = False
+    enable_mangohud: bool = False
+    enable_gamescope: bool = False
+    enable_wayland: bool = False
+    prefer_discrete_gpu: bool = False
+    enable_hdr: bool = False
+    force_nvapi: bool = False
+    disable_esync: bool = False
+    disable_fsync: bool = False
+    use_wined3d: bool = False
+    enable_proton_log: bool = False
+    force_large_address_aware: bool = False
+    prefer_sdl_input: bool = False
+    enable_wayland_raw_input: bool = False
+    dxvk_hud: str = "off"
+    wine_debug: str = ""
+    gamescope_window_mode: str = "borderless"
+    gamescope_game_width: int = 0
+    gamescope_game_height: int = 0
+    gamescope_output_width: int = 0
+    gamescope_output_height: int = 0
+    gamescope_refresh_rate: int = 0
+    gamescope_fps_limit: int = 0
+    gamescope_scaler: str = "auto"
+    gamescope_filter: str = "linear"
+    gamescope_sharpness: int = 10
+    gamescope_adaptive_sync: bool = False
+    gamescope_extra_arguments: str = ""
     use_default_proton: bool = True
     followup_enabled: bool = False
     wait_for_executable: str = ""

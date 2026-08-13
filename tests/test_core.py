@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import json
+import os
 import struct
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -17,6 +19,7 @@ from proton_launcher.models import (
     GameEntry,
     GameSource,
     LaunchProfile,
+    SteamLaunchOption,
 )
 from proton_launcher.process_watcher import (
     command_matches,
@@ -26,12 +29,15 @@ from proton_launcher.process_watcher import (
 from proton_launcher.profiles import ConfigStore
 from proton_launcher.proton import discover_protons
 from proton_launcher.protondb import (
+    CACHE_MAX_AGE_SECONDS,
+    ProtonDBCache,
     game_url,
     parse_rating,
     protondb_app_id,
     summary_url,
 )
 from proton_launcher.runner import (
+    WEMOD_GAME_WRAPPER_VARIABLE,
     WEMOD_STEAM_APP_ID_VARIABLE,
     WEMOD_STEAM_LIBRARY_VARIABLE,
     build_followup_launch_spec,
@@ -46,6 +52,7 @@ from proton_launcher.runner import (
 )
 from proton_launcher.steam import (
     is_component,
+    parse_appinfo_launches,
     parse_manifest,
     parse_shortcuts,
     resolve_game_executable,
@@ -103,6 +110,38 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(parse_rating(b'{"tier":"gold"}'), "Gold")
         self.assertIsNone(parse_rating(b'{"tier":null}'))
         self.assertIsNone(parse_rating(b"not json"))
+
+    def test_protondb_cache_persists_ratings_and_unrated_results(self):
+        path = self.tmp / "cache" / "protondb.json"
+        cache = ProtonDBCache(path)
+        fetched_at = time.time()
+        cache.put(1593500, "Gold", fetched_at=fetched_at)
+        cache.put(42, None, fetched_at=fetched_at)
+
+        loaded = ProtonDBCache(path)
+
+        self.assertEqual(
+            loaded.lookup(1593500, now=fetched_at + 1), (True, "Gold", True)
+        )
+        self.assertEqual(loaded.lookup(42, now=fetched_at + 1), (True, None, True))
+
+    def test_protondb_cache_marks_old_values_stale(self):
+        cache = ProtonDBCache(self.tmp / "protondb.json")
+        cache.put(1593500, "Gold", fetched_at=1_000)
+
+        self.assertEqual(
+            cache.lookup(1593500, now=1_000 + CACHE_MAX_AGE_SECONDS + 1),
+            (True, "Gold", False),
+        )
+
+    def test_empty_xdg_cache_home_uses_home_cache(self):
+        home = self.tmp / "home"
+        with patch.dict(os.environ, {"HOME": str(home), "XDG_CACHE_HOME": ""}):
+            cache = ProtonDBCache()
+
+        self.assertEqual(
+            cache.path, home / ".cache" / "proton-launcher" / "protondb.json"
+        )
 
     def test_non_steam_protondb_id_prefers_online_fix_real_app_id(self):
         game_dir = self.tmp / "Game"
@@ -605,8 +644,102 @@ class CoreTests(unittest.TestCase):
         manifest.write_text(
             '"AppState"\n{\n "appid" "42"\n "name" "A Game"\n "installdir" "A Game"\n}\n'
         )
-        game = parse_manifest(manifest, root, library, r"bin\ActualGame.exe")
+        launcher = install / "Launcher.exe"
+        launcher.touch()
+        game = parse_manifest(
+            manifest,
+            root,
+            library,
+            [
+                SteamLaunchOption("", r"BIN\actualgame.EXE"),
+                SteamLaunchOption("Open launcher", "launcher.exe", "--settings"),
+            ],
+        )
         self.assertEqual(game.default_executable, str(executable))
+        self.assertEqual(
+            game.launch_options,
+            (
+                SteamLaunchOption("Play A Game", str(executable)),
+                SteamLaunchOption("Open launcher", str(launcher), "--settings"),
+            ),
+        )
+
+    def test_appinfo_parser_reads_all_windows_launch_options(self):
+        appinfo = {
+            "appinfo": {
+                "config": {
+                    "launch": {
+                        "0": {
+                            "executable": "Game.exe",
+                            "type": "default",
+                            "config": {"oslist": "windows"},
+                        },
+                        "1": {
+                            "executable": "Launcher.exe",
+                            "arguments": "--settings",
+                            "type": "option2",
+                            "description": "Open launcher",
+                            "config": {"oslist": "windows"},
+                        },
+                        "2": {
+                            "executable": "Game.app",
+                            "type": "none",
+                            "config": {"oslist": "macos"},
+                        },
+                        "3": {
+                            "executable": "AllPlatforms.exe",
+                            "description": "All platforms",
+                            "config": {"oslist": ""},
+                        },
+                    }
+                }
+            }
+        }
+        keys: list[str] = []
+
+        def collect(value):
+            for key, item in value.items():
+                if key not in keys:
+                    keys.append(key)
+                if isinstance(item, dict):
+                    collect(item)
+
+        def encode(value):
+            result = bytearray()
+            for key, item in value.items():
+                if isinstance(item, dict):
+                    result.extend(b"\x00" + struct.pack("<i", keys.index(key)))
+                    result.extend(encode(item))
+                else:
+                    result.extend(b"\x01" + struct.pack("<i", keys.index(key)))
+                    result.extend(str(item).encode() + b"\0")
+            result.extend(b"\x08")
+            return bytes(result)
+
+        collect(appinfo)
+        payload = encode(appinfo)
+        record = struct.pack("<II", 42, 60 + len(payload)) + bytes(60) + payload
+        terminator = struct.pack("<II", 0, 0)
+        key_table_offset = 16 + len(record) + len(terminator)
+        key_table = struct.pack("<I", len(keys)) + b"".join(
+            key.encode() + b"\0" for key in keys
+        )
+        path = self.tmp / "appinfo.vdf"
+        path.write_bytes(
+            struct.pack("<IIQ", 0x07564429, 1, key_table_offset)
+            + record
+            + terminator
+            + key_table
+        )
+
+        self.assertEqual(
+            parse_appinfo_launches(path, {42})[42],
+            [
+                SteamLaunchOption("", "Game.exe"),
+                SteamLaunchOption("Open launcher", "Launcher.exe", "--settings"),
+                SteamLaunchOption("All platforms", "AllPlatforms.exe"),
+            ],
+        )
 
     def test_executable_fallback_is_conservative(self):
         install = self.tmp / "Only Game"
@@ -715,6 +848,155 @@ class CoreTests(unittest.TestCase):
         )
         spec = build_launch_spec(game, profile)
         self.assertEqual(spec.arguments, ["run", str(executable)])
+
+    def test_runtime_switches_apply_supported_proton_environment(self):
+        proton = self.tmp / "proton"
+        proton.touch()
+        executable = self.tmp / "game.exe"
+        executable.touch()
+        steam = self.tmp / "Steam"
+        steam.mkdir()
+        game = GameEntry(GameSource.STEAM, 42, "Game", steam, steam)
+        profile = LaunchProfile(
+            "id",
+            "Options",
+            game.key,
+            str(proton),
+            executable=str(executable),
+            enable_wayland=True,
+            prefer_discrete_gpu=True,
+            force_nvapi=True,
+            disable_esync=True,
+            disable_fsync=True,
+            use_wined3d=True,
+            enable_proton_log=True,
+            force_large_address_aware=True,
+            prefer_sdl_input=True,
+            enable_wayland_raw_input=True,
+            dxvk_hud="fps",
+            wine_debug="+seh",
+        )
+
+        with patch(
+            "proton_launcher.runner.shutil.which",
+            return_value="/usr/bin/switcherooctl",
+        ):
+            spec = build_launch_spec(game, profile)
+
+        expected = {
+            "PROTON_ENABLE_WAYLAND": "1",
+            "PROTON_FORCE_NVAPI": "1",
+            "PROTON_NO_ESYNC": "1",
+            "PROTON_NO_FSYNC": "1",
+            "PROTON_USE_WINED3D": "1",
+            "PROTON_LOG": "1",
+            "PROTON_FORCE_LARGE_ADDRESS_AWARE": "1",
+            "PROTON_PREFER_SDL": "1",
+            "WAYLANDDRV_RAWINPUT": "1",
+            "DXVK_HUD": "fps",
+            "WINEDEBUG": "+seh",
+        }
+        for name, value in expected.items():
+            self.assertEqual(spec.environment[name], value)
+        self.assertEqual(spec.program, "/usr/bin/switcherooctl")
+        self.assertEqual(spec.arguments[:2], ["launch", str(proton)])
+
+    def test_gamescope_wraps_gamemode_and_uses_mangoapp(self):
+        proton = self.tmp / "proton"
+        proton.touch()
+        executable = self.tmp / "game.exe"
+        executable.touch()
+        steam = self.tmp / "Steam"
+        steam.mkdir()
+        game = GameEntry(GameSource.STEAM, 42, "Game", steam, steam)
+        profile = LaunchProfile(
+            "id",
+            "Gamescope",
+            game.key,
+            str(proton),
+            executable=str(executable),
+            enable_gamescope=True,
+            enable_gamemode=True,
+            enable_mangohud=True,
+            enable_hdr=True,
+            gamescope_window_mode="fullscreen",
+            gamescope_game_width=1920,
+            gamescope_game_height=1080,
+            gamescope_fps_limit=60,
+            gamescope_filter="fsr",
+            gamescope_sharpness=7,
+            gamescope_adaptive_sync=True,
+        )
+        tools = {
+            "gamescope": "/usr/bin/gamescope",
+            "gamemoderun": "/usr/bin/gamemoderun",
+            "mangoapp": "/usr/bin/mangoapp",
+        }
+        with patch("proton_launcher.runner.shutil.which", side_effect=tools.get):
+            spec = build_launch_spec(game, profile)
+
+        self.assertEqual(spec.program, "/usr/bin/gamescope")
+        self.assertEqual(
+            spec.arguments,
+            [
+                "-f",
+                "-w",
+                "1920",
+                "-h",
+                "1080",
+                "--framerate-limit",
+                "60",
+                "-F",
+                "fsr",
+                "--sharpness",
+                "7",
+                "--adaptive-sync",
+                "--hdr-enabled",
+                "--mangoapp",
+                "--",
+                "/usr/bin/gamemoderun",
+                str(proton),
+                "run",
+                str(executable),
+            ],
+        )
+        self.assertEqual(spec.environment["PROTON_ENABLE_HDR"], "1")
+        self.assertEqual(spec.environment["PROTON_ENABLE_WAYLAND"], "1")
+
+    def test_wemod_keeps_host_wrappers_on_the_game_side(self):
+        tool = self.tmp / "Proton"
+        tool.mkdir()
+        proton = tool / "proton"
+        proton.touch()
+        wemod = self.tmp / "wemod"
+        wemod.touch()
+        wemod_exe = self.tmp / "wemod_data" / "wemod_bin" / "WeMod.exe"
+        wemod_exe.parent.mkdir(parents=True)
+        wemod_exe.touch()
+        executable = self.tmp / "game.exe"
+        executable.touch()
+        steam = self.tmp / "Steam"
+        steam.mkdir()
+        game = GameEntry(GameSource.SHORTCUT, 42, "Game", steam, steam)
+        profile = LaunchProfile(
+            "id",
+            "WeMod",
+            game.key,
+            str(proton),
+            executable=str(executable),
+            launch_wemod=True,
+            enable_mangohud=True,
+        )
+        with patch(
+            "proton_launcher.runner.shutil.which", return_value="/usr/bin/mangohud"
+        ):
+            spec = build_launch_spec(game, profile, wemod_path=str(wemod))
+
+        self.assertNotEqual(spec.program, "/usr/bin/mangohud")
+        self.assertEqual(
+            json.loads(spec.environment[WEMOD_GAME_WRAPPER_VARIABLE]),
+            ["/usr/bin/mangohud"],
+        )
 
     def test_steam_launch_spec_uses_registered_app_id(self):
         steam_root = self.tmp / "Steam"
@@ -921,6 +1203,7 @@ class CoreTests(unittest.TestCase):
             "PL_WEMOD_WINEDLLOVERRIDES": DEFAULT_WEMOD_WINEDLLOVERRIDES,
             "PL_WEMOD_STEAM_LIBRARY": str(library),
             "PL_WEMOD_STEAM_APP_ID": "123",
+            "PL_GAME_WRAPPER_ARGUMENTS": json.dumps(["/usr/bin/gamescope", "-f", "--"]),
         }
 
         def configure_retry(_prefix, _arguments, _game, candidate, _app_id):
@@ -972,6 +1255,17 @@ class CoreTests(unittest.TestCase):
             DEFAULT_WEMOD_WINEDLLOVERRIDES,
         )
         self.assertNotIn("SteamGameId", wemod_environment)
+        self.assertEqual(
+            retry_popen.call_args_list[1].args[0],
+            [
+                "/usr/bin/gamescope",
+                "-f",
+                "--",
+                "proton",
+                "run",
+                str(executable),
+            ],
+        )
 
     def test_wemod_and_game_receive_separate_dll_overrides(self):
         tool = self.tmp / "Proton"

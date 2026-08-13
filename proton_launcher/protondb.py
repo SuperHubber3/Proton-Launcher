@@ -5,6 +5,9 @@ import configparser
 import json
 import os
 import re
+import tempfile
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from .models import GameEntry, GameSource
@@ -14,6 +17,102 @@ GAME_URL = "https://www.protondb.com/app/{app_id}"
 MAX_APP_ID = 0xFFFFFFFF
 METADATA_SEARCH_DEPTH = 5
 METADATA_SEARCH_DIRECTORY_LIMIT = 2_000
+CACHE_VERSION = 1
+CACHE_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+CACHE_RETENTION_SECONDS = 90 * 24 * 60 * 60
+
+
+@dataclass(frozen=True, slots=True)
+class CachedRating:
+    rating: str | None
+    fetched_at: float
+
+
+class ProtonDBCache:
+    def __init__(self, path: Path | None = None):
+        cache_home = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+        self.path = path or cache_home / "proton-launcher" / "protondb.json"
+        self.entries: dict[int, CachedRating] = {}
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            value = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(value, dict) or value.get("version") != CACHE_VERSION:
+            return
+        entries = value.get("entries")
+        if not isinstance(entries, dict):
+            return
+        now = time.time()
+        for raw_app_id, raw_entry in entries.items():
+            if not isinstance(raw_entry, dict):
+                continue
+            try:
+                app_id = int(raw_app_id)
+            except (TypeError, ValueError):
+                continue
+            rating = raw_entry.get("rating")
+            fetched_at = raw_entry.get("fetched_at")
+            if (
+                not 0 < app_id <= MAX_APP_ID
+                or not (rating is None or isinstance(rating, str))
+                or not isinstance(fetched_at, int | float)
+                or isinstance(fetched_at, bool)
+                or fetched_at <= 0
+                or now - fetched_at > CACHE_RETENTION_SECONDS
+            ):
+                continue
+            self.entries[app_id] = CachedRating(rating, float(fetched_at))
+
+    def lookup(
+        self, app_id: int, now: float | None = None
+    ) -> tuple[bool, str | None, bool]:
+        entry = self.entries.get(app_id)
+        if not entry:
+            return False, None, False
+        current_time = time.time() if now is None else now
+        fresh = current_time - entry.fetched_at <= CACHE_MAX_AGE_SECONDS
+        return True, entry.rating, fresh
+
+    def put(
+        self, app_id: int, rating: str | None, fetched_at: float | None = None
+    ) -> None:
+        self.entries[app_id] = CachedRating(
+            rating, time.time() if fetched_at is None else fetched_at
+        )
+        try:
+            self._save()
+        except OSError:
+            pass
+
+    def __setitem__(self, app_id: int, rating: str | None) -> None:
+        self.put(app_id, rating)
+
+    def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        value = {
+            "version": CACHE_VERSION,
+            "entries": {
+                str(app_id): {
+                    "rating": entry.rating,
+                    "fetched_at": entry.fetched_at,
+                }
+                for app_id, entry in sorted(self.entries.items())
+            },
+        }
+        fd, temporary = tempfile.mkstemp(
+            prefix=f".{self.path.name}-", dir=self.path.parent
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(value, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+            os.replace(temporary, self.path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
 
 def summary_url(app_id: int) -> str:

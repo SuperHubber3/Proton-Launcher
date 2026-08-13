@@ -26,8 +26,105 @@ RUNAS_HELPER = (
 WEMOD_OVERRIDES_VARIABLE = "PL_WEMOD_WINEDLLOVERRIDES"
 WEMOD_STEAM_LIBRARY_VARIABLE = "PL_WEMOD_STEAM_LIBRARY"
 WEMOD_STEAM_APP_ID_VARIABLE = "PL_WEMOD_STEAM_APP_ID"
+WEMOD_GAME_WRAPPER_VARIABLE = "PL_GAME_WRAPPER_ARGUMENTS"
 WEMOD_BRIDGE = Path(__file__).resolve().parent / "wemod_bridge.py"
 SYSTEM_DATA_DIRS = ("/usr/local/share", "/usr/share")
+
+
+def _runtime_environment(profile: LaunchProfile, environment: dict[str, str]) -> None:
+    """Apply profile switches without clearing user-supplied environment values."""
+    switches = {
+        "PROTON_ENABLE_WAYLAND": profile.enable_wayland or profile.enable_hdr,
+        "PROTON_ENABLE_HDR": profile.enable_hdr,
+        "PROTON_FORCE_NVAPI": profile.force_nvapi,
+        "PROTON_NO_ESYNC": profile.disable_esync,
+        "PROTON_NO_FSYNC": profile.disable_fsync,
+        "PROTON_USE_WINED3D": profile.use_wined3d,
+        "PROTON_LOG": profile.enable_proton_log or bool(profile.wine_debug.strip()),
+        "PROTON_FORCE_LARGE_ADDRESS_AWARE": profile.force_large_address_aware,
+        "PROTON_PREFER_SDL": profile.prefer_sdl_input,
+    }
+    for name, enabled in switches.items():
+        if enabled:
+            environment[name] = "1"
+    if profile.enable_wayland_raw_input:
+        environment["WAYLANDDRV_RAWINPUT"] = "1"
+    if profile.dxvk_hud != "off":
+        environment["DXVK_HUD"] = profile.dxvk_hud
+    if profile.wine_debug.strip():
+        environment["WINEDEBUG"] = profile.wine_debug.strip()
+
+
+def _gamescope_arguments(profile: LaunchProfile) -> list[str]:
+    arguments: list[str] = []
+    mode_flags = {"fullscreen": "-f", "borderless": "-b", "windowed": None}
+    if profile.gamescope_window_mode not in mode_flags:
+        raise ValueError("Gamescope window mode is invalid")
+    mode = mode_flags[profile.gamescope_window_mode]
+    if mode:
+        arguments.append(mode)
+    dimensions = (
+        ("-w", profile.gamescope_game_width),
+        ("-h", profile.gamescope_game_height),
+        ("-W", profile.gamescope_output_width),
+        ("-H", profile.gamescope_output_height),
+        ("-r", profile.gamescope_refresh_rate),
+        ("--framerate-limit", profile.gamescope_fps_limit),
+    )
+    for flag, value in dimensions:
+        if value:
+            arguments.extend((flag, str(value)))
+    if profile.gamescope_scaler != "auto":
+        arguments.extend(("-S", profile.gamescope_scaler))
+    if profile.gamescope_filter != "linear":
+        arguments.extend(("-F", profile.gamescope_filter))
+    if profile.gamescope_filter in {"fsr", "nis"}:
+        arguments.extend(("--sharpness", str(profile.gamescope_sharpness)))
+    if profile.gamescope_adaptive_sync:
+        arguments.append("--adaptive-sync")
+    if profile.enable_hdr:
+        arguments.append("--hdr-enabled")
+    if profile.enable_mangohud:
+        arguments.append("--mangoapp")
+    arguments.extend(shlex.split(profile.gamescope_extra_arguments))
+    return arguments
+
+
+def _required_program(program: str, feature: str) -> str:
+    path = shutil.which(program)
+    if not path:
+        raise ValueError(f"{feature} is enabled but {program} is not installed")
+    return path
+
+
+def _host_wrapper_arguments(profile: LaunchProfile) -> list[str]:
+    """Return host-side command elements placed before Proton."""
+    arguments: list[str] = []
+    if profile.prefer_discrete_gpu:
+        switcherooctl = _required_program("switcherooctl", "Discrete GPU preference")
+        arguments.extend((switcherooctl, "launch"))
+    if profile.enable_gamescope:
+        gamescope = _required_program("gamescope", "Gamescope")
+        if profile.enable_mangohud:
+            _required_program("mangoapp", "MangoHud with Gamescope")
+        arguments.extend((gamescope, *_gamescope_arguments(profile), "--"))
+    if profile.enable_gamemode:
+        arguments.append(_required_program("gamemoderun", "GameMode"))
+    if profile.enable_mangohud and not profile.enable_gamescope:
+        arguments.append(_required_program("mangohud", "MangoHud"))
+    return arguments
+
+
+def _wrap_launch_spec(
+    proton: Path,
+    arguments: list[str],
+    environment: dict[str, str],
+    working: Path,
+    profile: LaunchProfile,
+) -> LaunchSpec:
+    wrappers = _host_wrapper_arguments(profile)
+    command = [*wrappers, str(proton), *arguments]
+    return LaunchSpec(command[0], command[1:], environment, str(working))
 
 
 def process_environment() -> dict[str, str]:
@@ -205,6 +302,7 @@ def build_launch_spec(
     for name, value in parse_environment_text(profile.environment_text).items():
         if name not in {"STEAM_COMPAT_DATA_PATH", "STEAM_COMPAT_CLIENT_INSTALL_PATH"}:
             environment[name] = value
+    _runtime_environment(profile, environment)
     if profile.apply_online_fix:
         environment["WINEDLLOVERRIDES"] = DEFAULT_NON_STEAM_WINEDLLOVERRIDES
     environment["STEAM_COMPAT_DATA_PATH"] = str(prefix_path)
@@ -256,6 +354,9 @@ def build_launch_spec(
         else:
             environment.pop("WINEDLLOVERRIDES", None)
         environment["STEAM_COMPAT_TOOL_PATHS"] = str(proton.parent)
+        wrappers = _host_wrapper_arguments(profile)
+        if wrappers:
+            environment[WEMOD_GAME_WRAPPER_VARIABLE] = json.dumps(wrappers)
         return LaunchSpec(
             sys.executable,
             [
@@ -267,7 +368,7 @@ def build_launch_spec(
             environment,
             str(working),
         )
-    return LaunchSpec(str(proton), arguments, environment, str(working))
+    return _wrap_launch_spec(proton, arguments, environment, working, profile)
 
 
 def build_followup_launch_spec(
