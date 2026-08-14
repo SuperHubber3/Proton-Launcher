@@ -240,7 +240,12 @@ class SessionManager:
                     check=False,
                     timeout=2,
                 )
-                return result.stdout.strip() in {"active", "activating", "reloading"}
+                return result.stdout.strip() in {
+                    "active",
+                    "activating",
+                    "deactivating",
+                    "reloading",
+                }
             except (OSError, subprocess.TimeoutExpired):
                 return False
         child = self._children.get(record.id)
@@ -264,11 +269,11 @@ class SessionManager:
             return
         if record.backend == "systemd" and record.unit:
             subprocess.run(
-                ["systemctl", "--user", "stop", record.unit],
+                ["systemctl", "--user", "--no-block", "stop", record.unit],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
-                timeout=10,
+                timeout=2,
             )
         elif record.pid and process_start_ticks(record.pid) == record.start_ticks:
             try:

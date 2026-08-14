@@ -13,18 +13,19 @@ from PySide6.QtWidgets import (  # noqa: E402
     QApplication,
     QDialog,
     QMessageBox,
-    QPushButton,
     QToolBar,
 )
 
 from proton_launcher.models import (
     GameEntry,
     GameSource,
+    LaunchProfile,
     ProtonInstallation,
     SteamLaunchOption,
 )  # noqa: E402
 from proton_launcher.profiles import ConfigStore  # noqa: E402
 from proton_launcher.protondb import protondb_app_id  # noqa: E402
+from proton_launcher.runtime_options_dialog import RuntimeOptionsDialog  # noqa: E402
 from proton_launcher.ui import MainWindow  # noqa: E402
 
 
@@ -146,6 +147,43 @@ class UiTests(unittest.TestCase):
         self.window.load_profile(profile)
         self.assertTrue(self.window.gamemode_checkbox.isChecked())
         self.assertEqual(self.window.runtime_option_values["gamescope_fps_limit"], 72)
+
+    def test_wemod_disables_wayland_options_without_clearing_them(self):
+        self.window.wayland_checkbox.setChecked(True)
+        self.window.gamescope_checkbox.setChecked(True)
+        self.window.wemod_checkbox.setChecked(True)
+
+        self.assertTrue(self.window.wayland_checkbox.isChecked())
+        self.assertFalse(self.window.wayland_checkbox.isEnabled())
+        self.assertIn("Unavailable with WeMod", self.window.wayland_checkbox.toolTip())
+        self.assertTrue(self.window.gamescope_checkbox.isChecked())
+        self.assertFalse(self.window.gamescope_checkbox.isEnabled())
+        self.assertIn(
+            "incompatible with WeMod", self.window.gamescope_checkbox.toolTip()
+        )
+
+        dialog = RuntimeOptionsDialog(
+            LaunchProfile(
+                id="test",
+                name="Test",
+                game_key="shortcut:42",
+                launch_wemod=True,
+                enable_hdr=True,
+                enable_wayland_raw_input=True,
+            )
+        )
+        self.assertTrue(dialog.hdr.isChecked())
+        self.assertFalse(dialog.hdr.isEnabled())
+        self.assertTrue(dialog.raw_input.isChecked())
+        self.assertFalse(dialog.raw_input.isEnabled())
+        self.assertFalse(dialog.tabs.isTabEnabled(1))
+        dialog.close()
+
+        self.window.wemod_checkbox.setChecked(False)
+        self.assertTrue(self.window.wayland_checkbox.isChecked())
+        self.assertTrue(self.window.wayland_checkbox.isEnabled())
+        self.assertTrue(self.window.gamescope_checkbox.isChecked())
+        self.assertTrue(self.window.gamescope_checkbox.isEnabled())
 
     def test_runtime_dialog_ignores_unknown_and_quick_toggle_values(self):
         dialog = MagicMock()
@@ -305,13 +343,8 @@ class UiTests(unittest.TestCase):
         self.assertEqual(profile.proton_path, str(self.window.protons[0].launcher))
 
     def test_wemod_configure_opens_integrations_tab(self):
-        configure = next(
-            button
-            for button in self.window.findChildren(QPushButton)
-            if button.text() == "Configure…"
-        )
         with patch("proton_launcher.ui.SettingsDialog") as dialog:
-            configure.click()
+            self.window.configure_wemod_button.click()
         self.assertEqual(dialog.call_args.kwargs["initial_tab"], "integrations")
 
     def test_launch_wemod_uses_selected_game_prefix(self):

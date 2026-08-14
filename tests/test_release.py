@@ -187,6 +187,65 @@ class ReleaseTests(unittest.TestCase):
                 self.assertEqual(manager.active(), [])
             is_active.assert_not_called()
 
+    def test_systemd_stop_request_does_not_block_for_service_shutdown(self):
+        environment = {
+            "XDG_STATE_HOME": str(self.tmp / "state"),
+            "XDG_RUNTIME_DIR": str(self.tmp / "runtime"),
+        }
+        with (
+            patch.dict(os.environ, environment),
+            patch.object(SessionManager, "_detect_systemd", return_value=True),
+        ):
+            manager = SessionManager()
+            record = SessionRecord(
+                "running-session",
+                SessionKind.PRIMARY.value,
+                "game",
+                "Game",
+                str(self.tmp / "prefix"),
+                "systemd",
+                unit="proton-launcher-running.service",
+                phase="running",
+            )
+            with patch("proton_launcher.sessions.subprocess.run") as run:
+                manager.stop(record)
+
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "systemctl",
+                "--user",
+                "--no-block",
+                "stop",
+                "proton-launcher-running.service",
+            ],
+        )
+        self.assertEqual(record.phase, "stopping")
+
+    def test_systemd_deactivating_session_remains_active(self):
+        environment = {
+            "XDG_STATE_HOME": str(self.tmp / "state"),
+            "XDG_RUNTIME_DIR": str(self.tmp / "runtime"),
+        }
+        with (
+            patch.dict(os.environ, environment),
+            patch.object(SessionManager, "_detect_systemd", return_value=True),
+        ):
+            manager = SessionManager()
+            record = SessionRecord(
+                "stopping-session",
+                SessionKind.PRIMARY.value,
+                "game",
+                "Game",
+                str(self.tmp / "prefix"),
+                "systemd",
+                unit="proton-launcher-stopping.service",
+                phase="stopping",
+            )
+            result = subprocess.CompletedProcess([], 0, stdout="deactivating\n")
+            with patch("proton_launcher.sessions.subprocess.run", return_value=result):
+                self.assertTrue(manager.is_active(record))
+
     def test_background_followup_watcher_runs_without_gui(self):
         environment = {
             "XDG_STATE_HOME": str(self.tmp / "state"),

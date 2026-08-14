@@ -37,6 +37,8 @@ from proton_launcher.protondb import (
     summary_url,
 )
 from proton_launcher.runner import (
+    WEMOD_DISPLAY_NOTICE_VARIABLE,
+    WEMOD_GAME_ENVIRONMENT_VARIABLE,
     WEMOD_GAME_WRAPPER_VARIABLE,
     WEMOD_STEAM_APP_ID_VARIABLE,
     WEMOD_STEAM_LIBRARY_VARIABLE,
@@ -985,7 +987,13 @@ class CoreTests(unittest.TestCase):
             str(proton),
             executable=str(executable),
             launch_wemod=True,
+            enable_gamescope=True,
             enable_mangohud=True,
+            enable_wayland=True,
+            enable_hdr=True,
+            enable_wayland_raw_input=True,
+            force_nvapi=True,
+            environment_text="GAME_SETTING=enabled",
         )
         with patch(
             "proton_launcher.runner.shutil.which", return_value="/usr/bin/mangohud"
@@ -997,6 +1005,14 @@ class CoreTests(unittest.TestCase):
             json.loads(spec.environment[WEMOD_GAME_WRAPPER_VARIABLE]),
             ["/usr/bin/mangohud"],
         )
+        self.assertEqual(
+            set(json.loads(spec.environment[WEMOD_GAME_ENVIRONMENT_VARIABLE])),
+            {"PROTON_FORCE_NVAPI"},
+        )
+        self.assertNotIn("PROTON_ENABLE_WAYLAND", spec.environment)
+        self.assertNotIn("PROTON_ENABLE_HDR", spec.environment)
+        self.assertNotIn("WAYLANDDRV_RAWINPUT", spec.environment)
+        self.assertEqual(spec.environment[WEMOD_DISPLAY_NOTICE_VARIABLE], "1")
 
     def test_steam_launch_spec_uses_registered_app_id(self):
         steam_root = self.tmp / "Steam"
@@ -1204,6 +1220,12 @@ class CoreTests(unittest.TestCase):
             "PL_WEMOD_STEAM_LIBRARY": str(library),
             "PL_WEMOD_STEAM_APP_ID": "123",
             "PL_GAME_WRAPPER_ARGUMENTS": json.dumps(["/usr/bin/gamescope", "-f", "--"]),
+            "PL_GAME_ONLY_ENVIRONMENT": json.dumps(
+                ["PROTON_ENABLE_WAYLAND", "PROTON_FORCE_NVAPI", "GAME_SETTING"]
+            ),
+            "PROTON_ENABLE_WAYLAND": "1",
+            "PROTON_FORCE_NVAPI": "1",
+            "GAME_SETTING": "enabled",
         }
 
         def configure_retry(_prefix, _arguments, _game, candidate, _app_id):
@@ -1255,6 +1277,13 @@ class CoreTests(unittest.TestCase):
             DEFAULT_WEMOD_WINEDLLOVERRIDES,
         )
         self.assertNotIn("SteamGameId", wemod_environment)
+        self.assertNotIn("PROTON_ENABLE_WAYLAND", wemod_environment)
+        self.assertNotIn("PROTON_FORCE_NVAPI", wemod_environment)
+        self.assertNotIn("GAME_SETTING", wemod_environment)
+        game_environment = retry_popen.call_args_list[1].kwargs["env"]
+        self.assertEqual(game_environment["PROTON_ENABLE_WAYLAND"], "1")
+        self.assertEqual(game_environment["PROTON_FORCE_NVAPI"], "1")
+        self.assertEqual(game_environment["GAME_SETTING"], "enabled")
         self.assertEqual(
             retry_popen.call_args_list[1].args[0],
             [

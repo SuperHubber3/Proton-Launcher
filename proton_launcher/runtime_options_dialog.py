@@ -27,16 +27,21 @@ class RuntimeOptionsDialog(QDialog):
         self.setWindowTitle("Launch options")
         self.resize(600, 520)
 
-        tabs = QTabWidget()
-        tabs.addTab(self._general_tab(profile), "General")
-        tabs.addTab(self._gamescope_tab(profile), "Gamescope")
-        tabs.addTab(self._troubleshooting_tab(profile), "Troubleshooting")
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._general_tab(profile), "General")
+        self.tabs.addTab(self._gamescope_tab(profile), "Gamescope")
+        self.tabs.addTab(self._troubleshooting_tab(profile), "Troubleshooting")
+        if profile.launch_wemod:
+            self.tabs.setTabEnabled(1, False)
+            self.tabs.setTabToolTip(
+                1, "Unavailable because Gamescope is incompatible with WeMod"
+            )
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout = QVBoxLayout(self)
-        layout.addWidget(tabs)
+        layout.addWidget(self.tabs)
         layout.addWidget(buttons)
 
     @staticmethod
@@ -59,6 +64,14 @@ class RuntimeOptionsDialog(QDialog):
         self.force_nvapi.setChecked(profile.force_nvapi)
         self.raw_input = QCheckBox("Use unaccelerated mouse input on native Wayland")
         self.raw_input.setChecked(profile.enable_wayland_raw_input)
+        if profile.launch_wemod:
+            unavailable = (
+                "Unavailable with WeMod because WeMod and the game share one Wine "
+                "display driver"
+            )
+            for widget in (self.hdr, self.raw_input):
+                widget.setEnabled(False)
+                widget.setToolTip(unavailable)
         self.sdl_input = QCheckBox("Prefer SDL controller input")
         self.sdl_input.setChecked(profile.prefer_sdl_input)
         self.dxvk_hud = QComboBox()

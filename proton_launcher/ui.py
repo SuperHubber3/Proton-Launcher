@@ -350,11 +350,11 @@ class MainWindow(QMainWindow):
         wemod_row = QHBoxLayout()
         wemod_row.addWidget(self.wemod_checkbox)
         wemod_row.addWidget(self.wemod_status, 1)
-        configure_wemod = QPushButton("Configure…")
-        configure_wemod.clicked.connect(
+        self.configure_wemod_button = QPushButton("Configure…")
+        self.configure_wemod_button.clicked.connect(
             lambda _checked=False: self.open_settings("integrations")
         )
-        wemod_row.addWidget(configure_wemod)
+        wemod_row.addWidget(self.configure_wemod_button)
         self.launch_wemod_button = QPushButton("Launch WeMod")
         self.launch_wemod_button.clicked.connect(self.launch_wemod)
         wemod_row.addWidget(self.launch_wemod_button)
@@ -1621,7 +1621,8 @@ class MainWindow(QMainWindow):
             widget.setEnabled(
                 direct and (bool(shutil.which(program)) or widget.isChecked())
             )
-        self.wayland_checkbox.setEnabled(direct)
+        self._update_gamescope_availability()
+        self._update_wayland_availability()
         self.runtime_options_button.setEnabled(direct)
         self._overlay_mode_changed()
         self._wemod_mode_changed()
@@ -1639,6 +1640,43 @@ class MainWindow(QMainWindow):
             self.tabs.currentIndex() == 0 and not self.steam_launch_checkbox.isChecked()
         )
         self.wemod_checkbox.setEnabled(compatible)
+        self._update_gamescope_availability()
+        self._update_wayland_availability()
+
+    def _update_gamescope_availability(self) -> None:
+        if not hasattr(self, "gamescope_checkbox"):
+            return
+        if self.wemod_checkbox.isChecked():
+            self.gamescope_checkbox.setEnabled(False)
+            self.gamescope_checkbox.setToolTip(
+                "Unavailable because Gamescope is incompatible with WeMod"
+            )
+            return
+        direct = not self.steam_launch_checkbox.isChecked()
+        installed = bool(shutil.which("gamescope"))
+        self.gamescope_checkbox.setEnabled(
+            direct and (installed or self.gamescope_checkbox.isChecked())
+        )
+        self.gamescope_checkbox.setToolTip(
+            "" if installed else "gamescope is not installed"
+        )
+
+    def _update_wayland_availability(self) -> None:
+        if not hasattr(self, "wayland_checkbox"):
+            return
+        if self.wemod_checkbox.isChecked():
+            self.wayland_checkbox.setEnabled(False)
+            self.wayland_checkbox.setToolTip(
+                "Unavailable with WeMod because WeMod and the game share one Wine "
+                "display driver"
+            )
+            return
+        direct = not self.steam_launch_checkbox.isChecked()
+        self.wayland_checkbox.setEnabled(direct)
+        self.wayland_checkbox.setToolTip(
+            "Experimental Proton/GE-Proton Wine-Wayland driver; Steam overlay may "
+            "not work"
+        )
 
     def _mode_changed(self, *_args) -> None:
         self._update_wait_target()

@@ -27,11 +27,15 @@ WEMOD_OVERRIDES_VARIABLE = "PL_WEMOD_WINEDLLOVERRIDES"
 WEMOD_STEAM_LIBRARY_VARIABLE = "PL_WEMOD_STEAM_LIBRARY"
 WEMOD_STEAM_APP_ID_VARIABLE = "PL_WEMOD_STEAM_APP_ID"
 WEMOD_GAME_WRAPPER_VARIABLE = "PL_GAME_WRAPPER_ARGUMENTS"
+WEMOD_GAME_ENVIRONMENT_VARIABLE = "PL_GAME_ONLY_ENVIRONMENT"
+WEMOD_DISPLAY_NOTICE_VARIABLE = "PL_WEMOD_DISPLAY_NOTICE"
 WEMOD_BRIDGE = Path(__file__).resolve().parent / "wemod_bridge.py"
 SYSTEM_DATA_DIRS = ("/usr/local/share", "/usr/share")
 
 
-def _runtime_environment(profile: LaunchProfile, environment: dict[str, str]) -> None:
+def _runtime_environment(
+    profile: LaunchProfile, environment: dict[str, str]
+) -> set[str]:
     """Apply profile switches without clearing user-supplied environment values."""
     switches = {
         "PROTON_ENABLE_WAYLAND": profile.enable_wayland or profile.enable_hdr,
@@ -44,15 +48,21 @@ def _runtime_environment(profile: LaunchProfile, environment: dict[str, str]) ->
         "PROTON_FORCE_LARGE_ADDRESS_AWARE": profile.force_large_address_aware,
         "PROTON_PREFER_SDL": profile.prefer_sdl_input,
     }
+    applied: set[str] = set()
     for name, enabled in switches.items():
         if enabled:
             environment[name] = "1"
+            applied.add(name)
     if profile.enable_wayland_raw_input:
         environment["WAYLANDDRV_RAWINPUT"] = "1"
+        applied.add("WAYLANDDRV_RAWINPUT")
     if profile.dxvk_hud != "off":
         environment["DXVK_HUD"] = profile.dxvk_hud
+        applied.add("DXVK_HUD")
     if profile.wine_debug.strip():
         environment["WINEDEBUG"] = profile.wine_debug.strip()
+        applied.add("WINEDEBUG")
+    return applied
 
 
 def _gamescope_arguments(profile: LaunchProfile) -> list[str]:
@@ -97,20 +107,22 @@ def _required_program(program: str, feature: str) -> str:
     return path
 
 
-def _host_wrapper_arguments(profile: LaunchProfile) -> list[str]:
+def _host_wrapper_arguments(
+    profile: LaunchProfile, *, allow_gamescope: bool = True
+) -> list[str]:
     """Return host-side command elements placed before Proton."""
     arguments: list[str] = []
     if profile.prefer_discrete_gpu:
         switcherooctl = _required_program("switcherooctl", "Discrete GPU preference")
         arguments.extend((switcherooctl, "launch"))
-    if profile.enable_gamescope:
+    if profile.enable_gamescope and allow_gamescope:
         gamescope = _required_program("gamescope", "Gamescope")
         if profile.enable_mangohud:
             _required_program("mangoapp", "MangoHud with Gamescope")
         arguments.extend((gamescope, *_gamescope_arguments(profile), "--"))
     if profile.enable_gamemode:
         arguments.append(_required_program("gamemoderun", "GameMode"))
-    if profile.enable_mangohud and not profile.enable_gamescope:
+    if profile.enable_mangohud and not (profile.enable_gamescope and allow_gamescope):
         arguments.append(_required_program("mangohud", "MangoHud"))
     return arguments
 
@@ -299,10 +311,15 @@ def build_launch_spec(
         arguments.extend(command)
         arguments.extend(shlex.split(profile.arguments))
     environment = process_environment()
-    for name, value in parse_environment_text(profile.environment_text).items():
-        if name not in {"STEAM_COMPAT_DATA_PATH", "STEAM_COMPAT_CLIENT_INSTALL_PATH"}:
+    profile_environment = parse_environment_text(profile.environment_text)
+    protected_environment = {
+        "STEAM_COMPAT_DATA_PATH",
+        "STEAM_COMPAT_CLIENT_INSTALL_PATH",
+    }
+    for name, value in profile_environment.items():
+        if name not in protected_environment:
             environment[name] = value
-    _runtime_environment(profile, environment)
+    game_only_environment = _runtime_environment(profile, environment)
     if profile.apply_online_fix:
         environment["WINEDLLOVERRIDES"] = DEFAULT_NON_STEAM_WINEDLLOVERRIDES
     environment["STEAM_COMPAT_DATA_PATH"] = str(prefix_path)
@@ -340,6 +357,18 @@ def build_launch_spec(
             raise ValueError(
                 "Launch with WeMod cannot be combined with Run as administrator"
             )
+        shared_prefix_display = {
+            "PROTON_ENABLE_HDR",
+            "PROTON_ENABLE_WAYLAND",
+            "PROTON_USE_WAYLAND",
+            "WAYLANDDRV_RAWINPUT",
+        }
+        disabled_display = shared_prefix_display & environment.keys()
+        if disabled_display:
+            for name in disabled_display:
+                environment.pop(name, None)
+                game_only_environment.discard(name)
+            environment[WEMOD_DISPLAY_NOTICE_VARIABLE] = "1"
         wemod = expanded_path(wemod_path)
         if not wemod.is_file():
             raise ValueError(f"WeMod launcher does not exist: {wemod}")
@@ -354,9 +383,13 @@ def build_launch_spec(
         else:
             environment.pop("WINEDLLOVERRIDES", None)
         environment["STEAM_COMPAT_TOOL_PATHS"] = str(proton.parent)
-        wrappers = _host_wrapper_arguments(profile)
+        wrappers = _host_wrapper_arguments(profile, allow_gamescope=False)
         if wrappers:
             environment[WEMOD_GAME_WRAPPER_VARIABLE] = json.dumps(wrappers)
+        if game_only_environment:
+            environment[WEMOD_GAME_ENVIRONMENT_VARIABLE] = json.dumps(
+                sorted(game_only_environment)
+            )
         return LaunchSpec(
             sys.executable,
             [

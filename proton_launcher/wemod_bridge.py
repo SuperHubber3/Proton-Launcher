@@ -31,6 +31,8 @@ WEMOD_VARIABLE = "PL_WEMOD_WINEDLLOVERRIDES"
 STEAM_LIBRARY_VARIABLE = "PL_WEMOD_STEAM_LIBRARY"
 STEAM_APP_ID_VARIABLE = "PL_WEMOD_STEAM_APP_ID"
 GAME_WRAPPER_VARIABLE = "PL_GAME_WRAPPER_ARGUMENTS"
+GAME_ENVIRONMENT_VARIABLE = "PL_GAME_ONLY_ENVIRONMENT"
+DISPLAY_NOTICE_VARIABLE = "PL_WEMOD_DISPLAY_NOTICE"
 STEAM_RETRY_HELPER = (
     Path(__file__).resolve().parent.parent / "helpers" / "steam-retry-helper.exe"
 )
@@ -333,7 +335,7 @@ def _initialize_prefix(
 ) -> bool:
     """Create the base prefix, then let wemod-launcher prepare its dependencies."""
     print("WeMod prefix is not initialized; preparing it now...", flush=True)
-    bootstrap_environment = dict(game_environment)
+    bootstrap_environment = dict(wemod_environment)
     for name in (
         "LD_PRELOAD",
         "SteamAppId",
@@ -461,6 +463,7 @@ def main() -> int:
         return 2
 
     game_environment = dict(os.environ)
+    display_notice = game_environment.pop(DISPLAY_NOTICE_VARIABLE, "")
     encoded_wrappers = game_environment.pop(GAME_WRAPPER_VARIABLE, "[]")
     try:
         game_wrappers = json.loads(encoded_wrappers)
@@ -472,12 +475,30 @@ def main() -> int:
     ):
         print("Invalid game wrapper argument list", file=sys.stderr)
         return 2
+    encoded_game_environment = game_environment.pop(GAME_ENVIRONMENT_VARIABLE, "[]")
+    try:
+        game_only_environment = json.loads(encoded_game_environment)
+    except json.JSONDecodeError:
+        print("Invalid game-only environment list", file=sys.stderr)
+        return 2
+    if not isinstance(game_only_environment, list) or not all(
+        isinstance(item, str) for item in game_only_environment
+    ):
+        print("Invalid game-only environment list", file=sys.stderr)
+        return 2
     prefix = Path(game_environment.get("STEAM_COMPAT_DATA_PATH", ""))
+    if display_notice:
+        print(
+            "Native Wayland disabled because WeMod and the game share one Wine server",
+            flush=True,
+        )
     marker = prefix / "pfx" / ".wemod_installer"
     wemod_overrides = game_environment.pop(WEMOD_VARIABLE, "")
     steam_library = game_environment.pop(STEAM_LIBRARY_VARIABLE, "")
     steam_app_id = game_environment.pop(STEAM_APP_ID_VARIABLE, "")
     wemod_environment = dict(game_environment)
+    for name in game_only_environment:
+        wemod_environment.pop(name, None)
     if wemod_overrides:
         wemod_environment["WINEDLLOVERRIDES"] = wemod_overrides
     else:
