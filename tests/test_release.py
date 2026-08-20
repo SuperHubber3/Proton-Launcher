@@ -222,6 +222,31 @@ class ReleaseTests(unittest.TestCase):
         )
         self.assertEqual(record.phase, "stopping")
 
+    def test_prefix_free_watcher_requires_session_id(self):
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "XDG_STATE_HOME": str(self.tmp / "state"),
+                    "XDG_RUNTIME_DIR": str(self.tmp / "runtime"),
+                },
+            ),
+            patch.object(SessionManager, "_detect_systemd", return_value=False),
+        ):
+            manager = SessionManager()
+            spec = LaunchSpec("/bin/true", [], dict(os.environ), str(self.tmp))
+
+            with self.assertRaisesRegex(ValueError, "requires a session ID"):
+                manager.start(
+                    SessionKind.FOLLOWUP,
+                    spec,
+                    "native:1",
+                    "Native",
+                    self.tmp / "unused-prefix",
+                    watch_target="Game",
+                    watch_any_prefix=True,
+                )
+
     def test_systemd_deactivating_session_remains_active(self):
         environment = {
             "XDG_STATE_HOME": str(self.tmp / "state"),

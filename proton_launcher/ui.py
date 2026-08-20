@@ -33,8 +33,10 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSplitter,
     QSystemTrayIcon,
     QTabWidget,
@@ -43,7 +45,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .models import GameEntry, LaunchProfile, ProtonInstallation
+from .models import GameEntry, GameSource, LaunchProfile, ProtonInstallation
 from .process_watcher import find_matching_pids, primary_executable_name
 from .profiles import DEFAULT_PROFILE_ID, ConfigStore
 from .proton import (
@@ -71,7 +73,13 @@ from .runner import (
 from .runtime_options_dialog import RuntimeOptionsDialog
 from .sessions import SessionKind, SessionManager, SessionRecord
 from .settings_dialog import SettingsDialog
-from .steam import discover_games, discover_libraries, discover_steam_roots
+from .steam import (
+    appmanifest_path,
+    discover_games,
+    discover_libraries,
+    discover_steam_roots,
+    set_manifest_state_flags,
+)
 from .wemod_bridge import reset_wemod_prefix
 
 APP_ICON = Path(__file__).resolve().parent.parent / "assets" / "proton-launcher.svg"
@@ -125,7 +133,11 @@ class MainWindow(QMainWindow):
         self.named_profile_dirty = False
         self.session_records: dict[str, SessionRecord] = {}
         self.log_offsets: dict[str, int] = {}
-        self.active_session_signature: tuple[tuple[str, str, str], ...] = ()
+        self.console_lines: dict[str, list[str]] = {}
+        self.active_sessions: list[SessionRecord] = []
+        self.active_session_signature: (
+            tuple[str, tuple[tuple[str, str, str], ...]] | None
+        ) = None
         self.protondb_cache = ProtonDBCache()
         self.protondb_app_ids: dict[str, int | None] = {}
         self.protondb_pending: set[int] = set()
@@ -172,6 +184,10 @@ class MainWindow(QMainWindow):
         tools_menu = self.menuBar().addMenu("Tools")
         copy_options = tools_menu.addAction("Copy Steam Launch Options")
         copy_options.triggered.connect(self.copy_steam_launch_options)
+        stop_everything = tools_menu.addAction("Stop all running sessions")
+        stop_everything.triggered.connect(self.stop_all_sessions)
+        skip_everything = tools_menu.addAction("Skip all updates")
+        skip_everything.triggered.connect(self.skip_all_updates)
 
         toolbar = QToolBar("Actions", self)
         toolbar.setMovable(False)
@@ -197,25 +213,34 @@ class MainWindow(QMainWindow):
         self.game_combo = QComboBox()
         self.game_combo.setEditable(True)
         self.game_combo.setInsertPolicy(QComboBox.NoInsert)
+        self.game_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.game_combo.currentIndexChanged.connect(self.game_changed)
         game_row = QHBoxLayout()
         game_row.addWidget(self.game_combo, 1)
-        self.protondb_button = QPushButton("ProtonDB")
-        self.protondb_button.setEnabled(False)
-        self.protondb_button.clicked.connect(self.open_protondb)
-        game_row.addWidget(self.protondb_button)
-        self.prefix_badge = QLabel("Prefix: not selected")
-        self.prefix_badge.setStyleSheet(
-            "padding: 3px 7px; border: 1px solid palette(mid); border-radius: 5px;"
-        )
-        game_row.addWidget(self.prefix_badge)
         self.game_count_label = QLabel()
         self.game_count_label.setStyleSheet("color: palette(mid);")
         game_row.addWidget(self.game_count_label)
         form.addRow("Game", game_row)
 
+        game_details_row = QHBoxLayout()
+        self.protondb_button = QPushButton("ProtonDB")
+        self.protondb_button.setEnabled(False)
+        self.protondb_button.clicked.connect(self.open_protondb)
+        game_details_row.addWidget(self.protondb_button)
+        self.skip_update_button = QPushButton("Skip update")
+        self.skip_update_button.setEnabled(False)
+        self.skip_update_button.clicked.connect(self.skip_update)
+        game_details_row.addWidget(self.skip_update_button)
+        self.prefix_badge = QLabel("Prefix: not selected")
+        self.prefix_badge.setStyleSheet(
+            "padding: 3px 7px; border: 1px solid palette(mid); border-radius: 5px;"
+        )
+        self.prefix_badge.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        game_details_row.addWidget(self.prefix_badge, 1)
+        form.addRow("", game_details_row)
+
         self.proton_combo = QComboBox()
-        self.proton_combo.currentIndexChanged.connect(self._update_proton_tooltip)
+        self.proton_combo.currentIndexChanged.connect(self._proton_mode_changed)
         proton_row = QHBoxLayout()
         proton_row.addWidget(self.proton_combo, 1)
         self.proton_count_label = QLabel()
@@ -434,22 +459,29 @@ class MainWindow(QMainWindow):
         self.launch_button.clicked.connect(self.launch)
         log_controls.addWidget(self.launch_button)
         self.stop_game_button = QPushButton("Stop Game")
+        self.stop_game_button.setToolTip(
+            "Stop the primary session for the selected game"
+        )
         self.stop_game_button.clicked.connect(self.stop_game)
         log_controls.addWidget(self.stop_game_button)
         self.stop_followup_button = QPushButton("Stop Follow-up")
+        self.stop_followup_button.setToolTip(
+            "Stop follow-up sessions for the selected game"
+        )
         self.stop_followup_button.clicked.connect(self.stop_followup)
         log_controls.addWidget(self.stop_followup_button)
-        self.stop_all_button = QPushButton("Stop All")
+        self.stop_all_button = QPushButton("Stop All for Game")
+        self.stop_all_button.setToolTip("Stop every session for the selected game")
         self.stop_all_button.clicked.connect(self.stop_all)
         log_controls.addWidget(self.stop_all_button)
-        clear = QPushButton("Clear")
-        clear.clicked.connect(lambda: self.log.clear())
-        log_controls.addWidget(clear)
-        copy = QPushButton("Copy")
-        copy.clicked.connect(
-            lambda: QApplication.clipboard().setText(self.log.toPlainText())
-        )
-        log_controls.addWidget(copy)
+        self.clear_log_button = QPushButton("Clear")
+        self.clear_log_button.setToolTip("Clear the selected game's console")
+        self.clear_log_button.clicked.connect(self.clear_console)
+        log_controls.addWidget(self.clear_log_button)
+        self.copy_log_button = QPushButton("Copy")
+        self.copy_log_button.setToolTip("Copy the selected game's console")
+        self.copy_log_button.clicked.connect(self.copy_console)
+        log_controls.addWidget(self.copy_log_button)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(5000)
@@ -478,7 +510,7 @@ class MainWindow(QMainWindow):
         self.tray_stop_game.triggered.connect(self.stop_game)
         self.tray_stop_followup = menu.addAction("Stop Follow-up")
         self.tray_stop_followup.triggered.connect(self.stop_followup)
-        self.tray_stop_all = menu.addAction("Stop All")
+        self.tray_stop_all = menu.addAction("Stop All for Selected Game")
         self.tray_stop_all.triggered.connect(self.stop_all)
         menu.addSeparator()
         keep = menu.addAction("Quit and keep sessions")
@@ -655,13 +687,116 @@ class MainWindow(QMainWindow):
         if not QDesktopServices.openUrl(QUrl(game_url(self.current_protondb_app_id))):
             self.status.setText("Could not open the ProtonDB page")
 
+    def _update_skip_update_button(self, game: GameEntry | None) -> None:
+        available = bool(
+            game
+            and game.source == GameSource.STEAM
+            and appmanifest_path(game).is_file()
+        )
+        self.skip_update_button.setEnabled(available)
+        self.skip_update_button.setToolTip(
+            "Set this game's Steam appmanifest StateFlags value to 4"
+            if available
+            else "Only available for installed Steam games"
+        )
+
+    def skip_update(self) -> None:
+        game = self.current_game()
+        if not game or game.source != GameSource.STEAM:
+            return
+        manifest = appmanifest_path(game)
+        answer = QMessageBox.warning(
+            self,
+            "Skip Steam update?",
+            f"Set StateFlags to 4 for “{game.name}”?\n\n"
+            f"This edits:\n{manifest}\n\n"
+            "Completely exit Steam first. If Steam is running, it may overwrite "
+            "the change.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            set_manifest_state_flags(game)
+        except ValueError as error:
+            QMessageBox.critical(self, "Could not skip update", str(error))
+            self._log(f"Skip update failed: {error}")
+            return
+        self.status.setText(f"Set StateFlags to 4 for {game.name}")
+        self._log(f"Set StateFlags to 4 in {manifest}")
+
+    def skip_all_updates(self) -> None:
+        games = [
+            game
+            for game in self.games
+            if game.source == GameSource.STEAM and appmanifest_path(game).is_file()
+        ]
+        if not games:
+            QMessageBox.information(
+                self, "No Steam games", "No installed Steam appmanifests were found."
+            )
+            return
+        answer = QMessageBox.warning(
+            self,
+            "Skip updates for all Steam games?",
+            f"Set StateFlags to 4 in {len(games)} installed game manifests?\n\n"
+            "Completely exit Steam first. Steam can overwrite these changes while "
+            "it is running.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        updated: list[Path] = []
+        failures: list[str] = []
+        progress = QProgressDialog(
+            "Updating Steam appmanifests…", "Cancel", 0, len(games), self
+        )
+        progress.setWindowTitle("Skip all updates")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        cancelled = False
+        try:
+            for index, game in enumerate(games):
+                progress.setLabelText(f"Updating {game.name}")
+                progress.setValue(index)
+                QApplication.processEvents()
+                if progress.wasCanceled():
+                    cancelled = True
+                    break
+                try:
+                    updated.append(set_manifest_state_flags(game))
+                except ValueError as error:
+                    failures.append(f"{game.name}: {error}")
+        finally:
+            progress.close()
+        self._log(f"Set StateFlags to 4 in {len(updated)} Steam appmanifests")
+        if failures:
+            QMessageBox.warning(
+                self,
+                "Some manifests could not be changed",
+                "\n".join(failures),
+            )
+            self._log("Skip all updates failures:\n" + "\n".join(failures))
+        self.status.setText(
+            f"Changed {len(updated)} Steam appmanifests"
+            + (f"; {len(failures)} failed" if failures else "")
+            + ("; canceled" if cancelled else "")
+        )
+
     def game_changed(self, *_args) -> None:
         if self.autosave_timer.isActive() and self.current_profile:
             self._autosave_default()
         game = self.current_game()
         if not game:
+            self.game_combo.setToolTip("")
+            self._render_console()
             self._update_protondb_rating(None)
+            self._update_skip_update_button(None)
             self._update_wemod_status()
+            self.active_session_signature = None
+            self._update_session_view(self.active_sessions)
             return
         if (
             self.named_profile_dirty
@@ -693,7 +828,10 @@ class MainWindow(QMainWindow):
             if answer == QMessageBox.Save and old_game:
                 self._save_current_profile(old_game)
         self.store.data["last_game"] = game.key
+        self.game_combo.setToolTip(game.label)
+        self._render_console()
         self._update_protondb_rating(game)
+        self._update_skip_update_button(game)
         template = LaunchProfile(
             DEFAULT_PROFILE_ID,
             "Default",
@@ -744,6 +882,8 @@ class MainWindow(QMainWindow):
         self.load_profile(selected)
         self._update_prefix_badge()
         self._update_wemod_status()
+        self.active_session_signature = None
+        self._update_session_view(self.active_sessions)
 
     def profile_changed(self, *_args) -> None:
         game = self.current_game()
@@ -829,7 +969,7 @@ class MainWindow(QMainWindow):
         self._update_profile_buttons()
         self._steam_launch_mode_changed()
         self._followup_mode_changed()
-        self._wemod_mode_changed()
+        self._proton_mode_changed()
 
     def _populate_launch_options(self, profile: LaunchProfile) -> None:
         game = self.current_game()
@@ -924,9 +1064,14 @@ class MainWindow(QMainWindow):
             self.default_proton.display_name if self.default_proton else "Unavailable"
         )
         self.proton_combo.addItem(f"Launcher default: {default_name}", "__default__")
+        self.proton_combo.addItem("No Proton (native Linux)", "__native__")
         for proton in self.protons:
             self.proton_combo.addItem(proton.display_name, str(proton.launcher))
-        wanted = "__default__" if profile.use_default_proton else profile.proton_path
+        wanted = (
+            "__native__"
+            if profile.use_native_runtime
+            else "__default__" if profile.use_default_proton else profile.proton_path
+        )
         self.proton_combo.setCurrentIndex(max(0, self.proton_combo.findData(wanted)))
         self.proton_combo.blockSignals(False)
         self._update_proton_tooltip()
@@ -947,8 +1092,11 @@ class MainWindow(QMainWindow):
             id=str(uuid.uuid4()) if new_id or not current else current.id,
             name=name or (current.name if current else "Profile"),
             game_key=game.key,
-            proton_path="" if proton_data == "__default__" else proton_data,
+            proton_path=(
+                "" if proton_data in {"__default__", "__native__"} else proton_data
+            ),
             use_default_proton=proton_data == "__default__",
+            use_native_runtime=proton_data == "__native__",
             mode="executable" if self.tabs.currentIndex() == 0 else "command",
             executable=self.exe_edit.text(),
             command=self.command_edit.text(),
@@ -984,6 +1132,8 @@ class MainWindow(QMainWindow):
         )
 
     def _resolved_profile(self, profile: LaunchProfile) -> LaunchProfile:
+        if profile.use_native_runtime:
+            return replace(profile, proton_path="")
         if not profile.use_default_proton:
             return profile
         if not self.default_proton:
@@ -1113,9 +1263,12 @@ class MainWindow(QMainWindow):
                 self.store.save()
                 self._update_wemod_status()
             prefix = self._prefix_for_game(game)
-            if prepare_compatdata_directory(prefix):
-                self._log(f"Created compatibility-data directory: {prefix}")
+            if not profile.use_native_runtime and prepare_compatdata_directory(prefix):
+                self._log(f"Created compatibility-data directory: {prefix}", game.key)
             if profile.followup_enabled:
+                native_session_id = (
+                    uuid.uuid4().hex if profile.use_native_runtime else ""
+                )
                 target = (
                     primary_executable_name(
                         profile.mode, profile.executable, profile.command
@@ -1126,7 +1279,10 @@ class MainWindow(QMainWindow):
                 if not target:
                     raise ValueError("Enter the executable name to wait for")
                 followup_spec = build_followup_launch_spec(game, profile, prefix)
-                baseline = find_matching_pids(target, prefix)
+                watch_prefix = None if profile.use_native_runtime else prefix
+                baseline = find_matching_pids(
+                    target, watch_prefix, session_id=native_session_id
+                )
                 followup_record = self.sessions.start(
                     SessionKind.FOLLOWUP,
                     followup_spec,
@@ -1136,8 +1292,12 @@ class MainWindow(QMainWindow):
                     watch_target=target,
                     watch_baseline=baseline,
                     delay_seconds=profile.followup_delay,
+                    watch_any_prefix=profile.use_native_runtime,
+                    watch_session_id=native_session_id,
                 )
                 self._register_session(followup_record)
+            else:
+                native_session_id = ""
             spec = (
                 build_steam_launch_spec(game)
                 if profile.launch_through_steam
@@ -1146,6 +1306,7 @@ class MainWindow(QMainWindow):
                     profile,
                     prefix,
                     self.store.settings["wemod_launcher_path"],
+                    session_id=native_session_id,
                 )
             )
             record = self.sessions.start(
@@ -1157,7 +1318,7 @@ class MainWindow(QMainWindow):
                 steam_managed=profile.launch_through_steam,
             )
             self._register_session(record)
-            self._log("$ " + shlex.join([spec.program, *spec.arguments]))
+            self._log("$ " + shlex.join([spec.program, *spec.arguments]), game.key)
             self.status.setText(f"Launched {game.name}")
             self._refresh_sessions()
             if self.store.settings["auto_hide_after_launch"]:
@@ -1165,7 +1326,10 @@ class MainWindow(QMainWindow):
                     self.hide()
                     self.tray.showMessage("Proton Launcher", f"Launched {game.name}")
                 else:
-                    self._log("Auto-hide skipped because no system tray is available")
+                    self._log(
+                        "Auto-hide skipped because no system tray is available",
+                        game.key,
+                    )
         except (ValueError, OSError) as exc:
             if followup_record:
                 self.sessions.stop(followup_record)
@@ -1182,13 +1346,17 @@ class MainWindow(QMainWindow):
                 raise ValueError("Enable Follow-up launch first")
             self.stop_followup()
             prefix = self._prefix_for_game(game)
-            prepare_compatdata_directory(prefix)
+            if not profile.use_native_runtime:
+                prepare_compatdata_directory(prefix)
             spec = build_followup_launch_spec(game, profile, prefix)
             record = self.sessions.start(
                 SessionKind.FOLLOWUP, spec, game.key, game.name, prefix
             )
             self._register_session(record)
-            self._log("Follow-up: $ " + shlex.join([spec.program, *spec.arguments]))
+            self._log(
+                "Follow-up: $ " + shlex.join([spec.program, *spec.arguments]),
+                game.key,
+            )
         except (ValueError, OSError) as exc:
             QMessageBox.warning(self, "Cannot launch follow-up", str(exc))
 
@@ -1203,7 +1371,7 @@ class MainWindow(QMainWindow):
             profile = self._resolved_profile(self._profile_from_ui())
             prefix = self._prefix_for_game(game)
             if prepare_compatdata_directory(prefix):
-                self._log(f"Created compatibility-data directory: {prefix}")
+                self._log(f"Created compatibility-data directory: {prefix}", game.key)
             spec = build_wemod_launch_spec(game, profile, wemod_path, prefix)
             record = self.sessions.start(
                 SessionKind.WEMOD,
@@ -1213,7 +1381,9 @@ class MainWindow(QMainWindow):
                 prefix,
             )
             self._register_session(record)
-            self._log("WeMod: $ " + shlex.join([spec.program, *spec.arguments]))
+            self._log(
+                "WeMod: $ " + shlex.join([spec.program, *spec.arguments]), game.key
+            )
             self.status.setText(f"Launched WeMod for {game.name}")
             self._refresh_sessions()
         except (ValueError, OSError) as exc:
@@ -1226,6 +1396,8 @@ class MainWindow(QMainWindow):
 
     def _refresh_sessions(self) -> None:
         active = self.sessions.active()
+        previous_selected_active = bool(self._selected_sessions(self.active_sessions))
+        self.active_sessions = active
         for record in active:
             self._register_session(record)
         self._tail_session_logs()
@@ -1240,18 +1412,34 @@ class MainWindow(QMainWindow):
             for record_id, offset in self.log_offsets.items()
             if record_id in active_ids
         }
-        signature = tuple((record.id, record.kind, record.phase) for record in active)
+        game = self.current_game()
+        signature = (
+            game.key if game else "",
+            tuple((record.id, record.kind, record.phase) for record in active),
+        )
         if signature == self.active_session_signature:
             return
-        was_active = bool(self.active_session_signature)
         self.active_session_signature = signature
+        self._update_session_view(active, sessions_finished=previous_selected_active)
+
+    def _update_session_view(
+        self, active: list[SessionRecord], *, sessions_finished: bool = False
+    ) -> None:
         self._update_session_buttons(active)
-        if active:
-            labels = [f"{item.kind}: {item.phase}" for item in active]
+        selected = self._selected_sessions(active)
+        other_count = len(active) - len(selected)
+        if selected:
+            labels = [f"{item.kind}: {item.phase}" for item in selected]
+            if other_count:
+                labels.append(f"{other_count} other game session(s)")
             self.status.setText(" • ".join(labels))
-        elif was_active:
+        elif other_count:
+            self.status.setText(f"{other_count} session(s) running for other games")
+        elif sessions_finished:
             self.status.setText("Sessions finished")
             self._update_prefix_badge()
+        else:
+            self.status.setText("Ready")
 
     def _tail_session_logs(self) -> None:
         for record in self.session_records.values():
@@ -1269,15 +1457,23 @@ class MainWindow(QMainWindow):
                     }.get(record.kind, "")
                     cleaned = clean_process_output(data.decode(errors="replace"))
                     for line in cleaned.splitlines():
-                        self._log(prefix + line)
+                        self._log(prefix + line, record.game_key)
             except OSError:
                 continue
 
+    def _selected_sessions(self, records: list[SessionRecord]) -> list[SessionRecord]:
+        game = self.current_game()
+        if not game:
+            return []
+        return [record for record in records if record.game_key == game.key]
+
     def _update_session_buttons(self, active: list[SessionRecord]) -> None:
-        primary = any(item.kind == SessionKind.PRIMARY.value for item in active)
-        followup = any(item.kind == SessionKind.FOLLOWUP.value for item in active)
-        wemod = any(item.kind == SessionKind.WEMOD.value for item in active)
-        self.launch_button.setEnabled(not primary)
+        selected = self._selected_sessions(active)
+        has_game = self.current_game() is not None
+        primary = any(item.kind == SessionKind.PRIMARY.value for item in selected)
+        followup = any(item.kind == SessionKind.FOLLOWUP.value for item in selected)
+        wemod = any(item.kind == SessionKind.WEMOD.value for item in selected)
+        self.launch_button.setEnabled(has_game and not primary)
         self.launch_wemod_button.setEnabled(self._wemod_is_configured() and not wemod)
         self.stop_game_button.setEnabled(primary)
         self.stop_followup_button.setEnabled(followup)
@@ -1298,35 +1494,62 @@ class MainWindow(QMainWindow):
             else None
         )
         self.followup_launch_now_button.setEnabled(
-            self.followup_group.isChecked() and not followup
+            has_game and self.followup_group.isChecked() and not followup
         )
 
     def _update_followup_launch_button(self, checked: bool) -> None:
         followup = any(
-            kind == SessionKind.FOLLOWUP.value
-            for _session_id, kind, _phase in self.active_session_signature
+            record.kind == SessionKind.FOLLOWUP.value
+            for record in self._selected_sessions(self.active_sessions)
         )
-        self.followup_launch_now_button.setEnabled(checked and not followup)
+        self.followup_launch_now_button.setEnabled(
+            self.current_game() is not None and checked and not followup
+        )
 
     def stop_game(self) -> None:
-        primary = self.sessions.records(SessionKind.PRIMARY)
-        followups = self.sessions.records(SessionKind.FOLLOWUP)
-        for record in primary:
-            self.sessions.stop(record)
-        for record in followups:
-            if record.phase in {"starting", "waiting"}:
+        game = self.current_game()
+        if not game:
+            return
+        active = self.sessions.active()
+        for record in active:
+            if record.game_key != game.key:
+                continue
+            if record.kind == SessionKind.PRIMARY.value:
                 self.sessions.stop(record)
-        self._log("Stop Game requested")
+            elif record.kind == SessionKind.FOLLOWUP.value and record.phase in {
+                "starting",
+                "waiting",
+            }:
+                self.sessions.stop(record)
+        self._log("Stop Game requested", game.key)
         self._refresh_sessions()
 
     def stop_followup(self) -> None:
-        self.sessions.stop_kind(SessionKind.FOLLOWUP)
-        self._log("Stop Follow-up requested")
+        game = self.current_game()
+        if not game:
+            return
+        for record in self.sessions.active():
+            if (
+                record.game_key == game.key
+                and record.kind == SessionKind.FOLLOWUP.value
+            ):
+                self.sessions.stop(record)
+        self._log("Stop Follow-up requested", game.key)
         self._refresh_sessions()
 
     def stop_all(self) -> None:
+        game = self.current_game()
+        if not game:
+            return
+        for record in self.sessions.active():
+            if record.game_key == game.key:
+                self.sessions.stop(record)
+        self._log("Stop All for Game requested", game.key)
+        self._refresh_sessions()
+
+    def stop_all_sessions(self) -> None:
         self.sessions.stop_all()
-        self._log("Stop All requested")
+        self._log("Stop all running sessions requested")
         self._refresh_sessions()
 
     def _prefix_for_game(self, game: GameEntry) -> Path:
@@ -1339,6 +1562,12 @@ class MainWindow(QMainWindow):
         game = self.current_game()
         if not game:
             self.prefix_badge.setText("Prefix: not selected")
+            return
+        if self._native_runtime_selected():
+            self.prefix_badge.setText("Prefix: Not used by native launch")
+            self.prefix_badge.setToolTip(
+                "The selected profile runs its target directly on Linux"
+            )
             return
         prefix = self._prefix_for_game(game)
         metadata = read_prefix_metadata(prefix, self.protons)
@@ -1378,8 +1607,12 @@ class MainWindow(QMainWindow):
             and (self._prefix_for_game(game) / "pfx" / ".wemod_installer").is_file()
         )
         self.delete_wemod_button.setEnabled(initialized)
+        wemod_running = any(
+            record.kind == SessionKind.WEMOD.value
+            for record in self._selected_sessions(self.active_sessions)
+        )
         self.launch_wemod_button.setEnabled(
-            self._wemod_is_configured() and not self.sessions.records(SessionKind.WEMOD)
+            self._wemod_is_configured() and not wemod_running
         )
         if not path:
             self.wemod_status.setText("Not configured")
@@ -1389,7 +1622,12 @@ class MainWindow(QMainWindow):
 
     def _wemod_is_configured(self) -> bool:
         path = self.store.settings["wemod_launcher_path"]
-        return bool(self.current_game() and path and Path(path).expanduser().is_file())
+        return bool(
+            self.current_game()
+            and not self._native_runtime_selected()
+            and path
+            and Path(path).expanduser().is_file()
+        )
 
     def delete_wemod(self) -> None:
         game = self.current_game()
@@ -1637,7 +1875,9 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "wemod_checkbox"):
             return
         compatible = (
-            self.tabs.currentIndex() == 0 and not self.steam_launch_checkbox.isChecked()
+            self.tabs.currentIndex() == 0
+            and not self.steam_launch_checkbox.isChecked()
+            and not self._native_runtime_selected()
         )
         self.wemod_checkbox.setEnabled(compatible)
         self._update_gamescope_availability()
@@ -1671,6 +1911,12 @@ class MainWindow(QMainWindow):
                 "display driver"
             )
             return
+        if self._native_runtime_selected():
+            self.wayland_checkbox.setEnabled(False)
+            self.wayland_checkbox.setToolTip(
+                "Native Linux programs already use their host display backend"
+            )
+            return
         direct = not self.steam_launch_checkbox.isChecked()
         self.wayland_checkbox.setEnabled(direct)
         self.wayland_checkbox.setToolTip(
@@ -1685,7 +1931,9 @@ class MainWindow(QMainWindow):
     def _followup_mode_changed(self, *_args) -> None:
         executable = self.followup_mode_combo.currentData() == "executable"
         self.followup_browse_button.setEnabled(executable)
-        self.followup_admin_checkbox.setEnabled(executable)
+        self.followup_admin_checkbox.setEnabled(
+            executable and not self._native_runtime_selected()
+        )
         self.followup_target_edit.setPlaceholderText(
             "/path/to/tool.exe" if executable else "wine explorer ."
         )
@@ -1709,7 +1957,35 @@ class MainWindow(QMainWindow):
         data = str(self.proton_combo.currentData() or "")
         if data == "__default__" and self.default_proton:
             data = str(self.default_proton.launcher)
-        self.proton_combo.setToolTip(data)
+        self.proton_combo.setToolTip(
+            "Runs the executable directly without Proton"
+            if data == "__native__"
+            else data
+        )
+
+    def _native_runtime_selected(self) -> bool:
+        return self.proton_combo.currentData() == "__native__"
+
+    def _proton_mode_changed(self, *_args) -> None:
+        self._update_proton_tooltip()
+        if not hasattr(self, "admin_checkbox"):
+            return
+        native = self._native_runtime_selected()
+        self.steam_launch_checkbox.setEnabled(not native)
+        self.admin_checkbox.setEnabled(not native)
+        self.followup_admin_checkbox.setEnabled(
+            not native and self.followup_mode_combo.currentData() == "executable"
+        )
+        self.online_fix_checkbox.setEnabled(not native)
+        if native:
+            self.steam_launch_checkbox.setChecked(False)
+            self.admin_checkbox.setChecked(False)
+            self.followup_admin_checkbox.setChecked(False)
+            self.online_fix_checkbox.setChecked(False)
+            self.wemod_checkbox.setChecked(False)
+        self._wemod_mode_changed()
+        self._update_wayland_availability()
+        self._update_prefix_badge()
 
     def copy_steam_launch_options(self) -> None:
         try:
@@ -1731,8 +2007,31 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             QMessageBox.warning(self, "Cannot generate Steam Launch Options", str(exc))
 
-    def _log(self, text: str) -> None:
-        self.log.appendPlainText(text)
+    def _console_key(self) -> str:
+        return str(self.game_combo.currentData() or "__application__")
+
+    def _log(self, text: str, game_key: str | None = None) -> None:
+        key = game_key or self._console_key()
+        lines = self.console_lines.setdefault(key, [])
+        lines.extend(text.splitlines() or [""])
+        if len(lines) > 5000:
+            del lines[:-5000]
+        if key == self._console_key():
+            self.log.appendPlainText(text)
+
+    def _render_console(self) -> None:
+        self.log.setPlainText(
+            "\n".join(self.console_lines.get(self._console_key(), []))
+        )
+        scrollbar = self.log.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def clear_console(self) -> None:
+        self.console_lines.pop(self._console_key(), None)
+        self.log.clear()
+
+    def copy_console(self) -> None:
+        QApplication.clipboard().setText(self.log.toPlainText())
 
     def _show_from_tray(self) -> None:
         self.show()

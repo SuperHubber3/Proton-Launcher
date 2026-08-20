@@ -16,7 +16,7 @@ from .models import (
     LaunchProfile,
     LaunchSpec,
 )
-from .util import expanded_path
+from .util import expanded_path, unquote_path
 
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 WINDOWS_PATH = re.compile(r"^([A-Za-z]):[\\/](.*)$")
@@ -128,15 +128,90 @@ def _host_wrapper_arguments(
 
 
 def _wrap_launch_spec(
-    proton: Path,
+    program: str | Path,
     arguments: list[str],
     environment: dict[str, str],
     working: Path,
     profile: LaunchProfile,
 ) -> LaunchSpec:
     wrappers = _host_wrapper_arguments(profile)
-    command = [*wrappers, str(proton), *arguments]
+    command = [*wrappers, str(program), *arguments]
     return LaunchSpec(command[0], command[1:], environment, str(working))
+
+
+def _apply_overlay_environment(
+    game: GameEntry, profile: LaunchProfile, environment: dict[str, str]
+) -> None:
+    if not profile.inject_steam_overlay:
+        return
+    app_id = profile.overlay_app_id.strip() or str(game.app_id)
+    if not app_id.isdigit() or int(app_id) < 1:
+        raise ValueError("Overlay app ID must be a positive integer")
+    renderer32 = game.steam_root / "ubuntu12_32" / "gameoverlayrenderer.so"
+    renderer64 = game.steam_root / "ubuntu12_64" / "gameoverlayrenderer.so"
+    missing = [str(path) for path in (renderer32, renderer64) if not path.is_file()]
+    if missing:
+        raise ValueError("Steam overlay renderer is missing: " + ", ".join(missing))
+    preload = ":".join((str(renderer32), str(renderer64)))
+    if environment.get("LD_PRELOAD"):
+        preload += ":" + environment["LD_PRELOAD"]
+    environment["LD_PRELOAD"] = preload
+    environment["SteamAppId"] = app_id
+    environment["SteamGameId"] = app_id
+    environment["SteamOverlayGameId"] = app_id
+
+
+def _build_native_launch_spec(
+    game: GameEntry, profile: LaunchProfile, session_id: str = ""
+) -> LaunchSpec:
+    if profile.enable_hdr and not profile.enable_gamescope:
+        raise ValueError("Native HDR requires Gamescope")
+    if profile.launch_wemod:
+        raise ValueError("Launch with WeMod requires Proton")
+    if profile.run_as_admin:
+        raise ValueError("Run as administrator requires Proton")
+    if profile.apply_online_fix:
+        raise ValueError("Online-fix overrides require Proton")
+
+    executable_path: Path | None = None
+    if profile.mode == "executable":
+        if not profile.executable.strip():
+            raise ValueError("Choose an executable")
+        executable_path = expanded_path(profile.executable)
+        if not executable_path.is_file():
+            raise ValueError(f"Executable does not exist: {executable_path}")
+        if not os.access(executable_path, os.X_OK):
+            raise ValueError(
+                f"Native executable is not marked executable: {executable_path}"
+            )
+        program = str(executable_path)
+        arguments = shlex.split(profile.arguments)
+    else:
+        command = shlex.split(profile.command)
+        if not command:
+            raise ValueError("Enter a command")
+        program, *arguments = command
+        arguments.extend(shlex.split(profile.arguments))
+
+    environment = process_environment()
+    environment.update(parse_environment_text(profile.environment_text))
+    if session_id:
+        environment["PROTON_LAUNCHER_SESSION_ID"] = session_id
+    _apply_overlay_environment(game, profile, environment)
+    if profile.working_directory:
+        working_value = unquote_path(profile.working_directory)
+        if WINDOWS_PATH.match(working_value):
+            raise ValueError("Windows working directories require Proton")
+        working = expanded_path(working_value)
+        if not working.is_dir():
+            raise ValueError(f"Working directory does not exist: {working}")
+    elif executable_path:
+        working = executable_path.parent
+    elif game.shortcut_start_dir and expanded_path(game.shortcut_start_dir).is_dir():
+        working = expanded_path(game.shortcut_start_dir)
+    else:
+        working = Path.home()
+    return _wrap_launch_spec(program, arguments, environment, working, profile)
 
 
 def process_environment() -> dict[str, str]:
@@ -259,7 +334,10 @@ def build_launch_spec(
     profile: LaunchProfile,
     prefix: Path | None = None,
     wemod_path: str = "",
+    session_id: str = "",
 ) -> LaunchSpec:
+    if profile.use_native_runtime:
+        return _build_native_launch_spec(game, profile, session_id)
     proton = expanded_path(profile.proton_path)
     if not proton.is_file():
         raise ValueError(f"Proton launcher does not exist: {proton}")
@@ -324,22 +402,7 @@ def build_launch_spec(
         environment["WINEDLLOVERRIDES"] = DEFAULT_NON_STEAM_WINEDLLOVERRIDES
     environment["STEAM_COMPAT_DATA_PATH"] = str(prefix_path)
     environment["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = str(game.steam_root)
-    if profile.inject_steam_overlay:
-        app_id = profile.overlay_app_id.strip() or str(game.app_id)
-        if not app_id.isdigit() or int(app_id) < 1:
-            raise ValueError("Overlay app ID must be a positive integer")
-        renderer32 = game.steam_root / "ubuntu12_32" / "gameoverlayrenderer.so"
-        renderer64 = game.steam_root / "ubuntu12_64" / "gameoverlayrenderer.so"
-        missing = [str(path) for path in (renderer32, renderer64) if not path.is_file()]
-        if missing:
-            raise ValueError("Steam overlay renderer is missing: " + ", ".join(missing))
-        preload = ":".join((str(renderer32), str(renderer64)))
-        if environment.get("LD_PRELOAD"):
-            preload += ":" + environment["LD_PRELOAD"]
-        environment["LD_PRELOAD"] = preload
-        environment["SteamAppId"] = app_id
-        environment["SteamGameId"] = app_id
-        environment["SteamOverlayGameId"] = app_id
+    _apply_overlay_environment(game, profile, environment)
     if profile.working_directory:
         working = resolve_working_directory(profile.working_directory, prefix_path)
         if not working.is_dir():
@@ -413,6 +476,7 @@ def build_followup_launch_spec(
         name="Follow-up",
         game_key=game.key,
         proton_path=profile.proton_path,
+        use_native_runtime=profile.use_native_runtime,
         mode=profile.followup_mode,
         executable=profile.followup_executable,
         command=profile.followup_command,

@@ -125,6 +125,7 @@ class LaunchProfile:
     gamescope_adaptive_sync: bool = False
     gamescope_extra_arguments: str = ""
     use_default_proton: bool = True
+    use_native_runtime: bool = False
     followup_enabled: bool = False
     wait_for_executable: str = ""
     wait_for_primary_executable: bool = False

@@ -80,7 +80,10 @@ useful for alternate launch setups.
 
 The launcher default follows Steam's selected compatibility tool unless you
 choose a fixed Proton build in **Settings > General**. A profile can override
-that choice.
+that choice. Select **No Proton (native Linux)** to run a Linux executable or
+command directly. Wine-only options are disabled in this mode; GameMode,
+MangoHud, Gamescope, environment variables, and host-side working directories
+remain available.
 
 ## Launch options
 
@@ -168,6 +171,11 @@ enabled toggle takes precedence when both set the same variable.
 
 **Launch through Steam** asks Steam to start the selected game or shortcut.
 Steam then owns the Proton choice, launch options, and game process.
+
+**Skip update** sets the selected Steam game's appmanifest `StateFlags` value
+to `4`. Exit Steam before using it; a running Steam client can overwrite the
+manifest. **Tools > Skip all updates** applies the same edit to every installed
+Steam game found by the launcher.
 
 An already-running Steam client cannot inherit new environment variables from
 Proton Launcher. Use **Tools > Copy Steam Launch Options** and paste the result
@@ -267,6 +275,12 @@ The default is:
 Active sessions are restored when the GUI starts again. When closing the
 window, you can hide to the tray, keep sessions running, stop everything, or
 cancel.
+
+Each game has its own console and session controls. Switching games changes the
+visible output and the target of **Stop Game**, **Stop Follow-up**, **Stop All
+for Game**, **Clear**, and **Copy**. Sessions for other games keep running, and
+they do not disable **Launch** for the selected game. Use **Tools > Stop all
+running sessions** when you need to stop every game at once.
 
 ## Discovery and settings
 

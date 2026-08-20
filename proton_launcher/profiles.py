@@ -107,6 +107,7 @@ class ConfigValidator:
     }
     PROFILE_BOOLEANS = {
         "use_default_proton",
+        "use_native_runtime",
         "run_as_admin",
         "launch_through_steam",
         "inject_steam_overlay",
@@ -430,6 +431,31 @@ class ConfigValidator:
                 issues.append(
                     ValidationIssue(
                         f"{path}.{key}", "error", f"{key} must be true or false"
+                    )
+                )
+        if profile.get("use_native_runtime"):
+            incompatible = {
+                "use_default_proton": False,
+                "run_as_admin": False,
+                "launch_through_steam": False,
+                "apply_online_fix": False,
+                "launch_wemod": False,
+                "followup_run_as_admin": False,
+            }
+            repaired = [
+                key for key, expected_value in incompatible.items() if profile.get(key)
+            ]
+            if repaired:
+                for key in repaired:
+                    profile[key] = incompatible[key]
+                changed = True
+                issues.append(
+                    ValidationIssue(
+                        path,
+                        "warning",
+                        "disabled Proton-only fields in a native-runtime profile: "
+                        + ", ".join(repaired),
+                        True,
                     )
                 )
         for key in cls.PROFILE_INTEGERS:

@@ -7,6 +7,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import vdf
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import (  # noqa: E402
@@ -26,6 +28,7 @@ from proton_launcher.models import (
 from proton_launcher.profiles import ConfigStore  # noqa: E402
 from proton_launcher.protondb import protondb_app_id  # noqa: E402
 from proton_launcher.runtime_options_dialog import RuntimeOptionsDialog  # noqa: E402
+from proton_launcher.sessions import SessionRecord  # noqa: E402
 from proton_launcher.ui import MainWindow  # noqa: E402
 
 
@@ -119,6 +122,110 @@ class UiTests(unittest.TestCase):
         self.assertFalse(self.window.delete_button.isEnabled())
         self.assertEqual(self.window.protondb_button.text(), "ProtonDB")
         self.assertFalse(self.window.protondb_button.isEnabled())
+        self.assertFalse(self.window.skip_update_button.isEnabled())
+        self.assertFalse(hasattr(self.window, "console_game_label"))
+        self.assertGreaterEqual(
+            self.window.proton_combo.findData("__native__"),
+            0,
+        )
+
+    def test_native_runtime_selection_is_saved_and_disables_wine_options(self):
+        self.window.proton_combo.setCurrentIndex(
+            self.window.proton_combo.findData("__native__")
+        )
+
+        profile = self.window._profile_from_ui()
+
+        self.assertTrue(profile.use_native_runtime)
+        self.assertFalse(profile.use_default_proton)
+        self.assertEqual(profile.proton_path, "")
+
+        self.window._autosave_default()
+        loaded = ConfigStore(self.tmp / "config.json")
+        saved = next(
+            item
+            for item in loaded.profiles(self.window.current_game().key)
+            if item.id == "default"
+        )
+        self.assertTrue(saved.use_native_runtime)
+        self.assertFalse(saved.use_default_proton)
+        self.assertEqual(saved.proton_path, "")
+        self.assertFalse(self.window.admin_checkbox.isEnabled())
+        self.assertFalse(self.window.steam_launch_checkbox.isEnabled())
+        self.assertFalse(self.window.steam_launch_checkbox.isChecked())
+        self.assertFalse(self.window.online_fix_checkbox.isEnabled())
+        self.assertFalse(self.window.wemod_checkbox.isEnabled())
+        self.assertFalse(self.window.wayland_checkbox.isEnabled())
+        self.assertIn("directly", self.window.proton_combo.toolTip())
+
+        dialog = RuntimeOptionsDialog(profile)
+        self.assertFalse(dialog.force_nvapi.isEnabled())
+        self.assertFalse(dialog.raw_input.isEnabled())
+        self.assertFalse(dialog.sdl_input.isEnabled())
+        self.assertFalse(dialog.dxvk_hud.isEnabled())
+        self.assertFalse(dialog.tabs.isTabEnabled(2))
+        self.assertTrue(dialog.tabs.isTabEnabled(1))
+        dialog.close()
+
+    def test_skip_update_edits_selected_steam_manifest(self):
+        old_game = self.window.current_game()
+        steamapps = old_game.library_root / "steamapps"
+        manifest = steamapps / "appmanifest_42.acf"
+        manifest.write_text(
+            '"AppState"\n{\n\t"appid"\t\t"42"\n'
+            '\t"StateFlags"\t\t"6"\n\t"name"\t\t"Example"\n}\n'
+        )
+        game = GameEntry(
+            GameSource.STEAM,
+            42,
+            "Example",
+            old_game.steam_root,
+            old_game.library_root,
+        )
+        self.window.games = [game]
+        self.window.game_combo.blockSignals(True)
+        self.window.game_combo.clear()
+        self.window.game_combo.addItem(game.label, game.key)
+        self.window.game_combo.blockSignals(False)
+        self.window.game_combo.setCurrentIndex(0)
+        self.window.game_changed()
+
+        self.assertTrue(self.window.skip_update_button.isEnabled())
+        with patch.object(QMessageBox, "warning", return_value=QMessageBox.Yes):
+            self.window.skip_update_button.click()
+
+        with manifest.open() as handle:
+            self.assertEqual(vdf.load(handle)["AppState"]["StateFlags"], "4")
+
+    def test_skip_all_updates_edits_every_installed_steam_game(self):
+        old_game = self.window.current_game()
+        steamapps = old_game.library_root / "steamapps"
+        games = []
+        for app_id in (41, 42):
+            manifest = steamapps / f"appmanifest_{app_id}.acf"
+            manifest.write_text(
+                '"AppState"\n{\n'
+                f'\t"appid"\t\t"{app_id}"\n'
+                '\t"StateFlags"\t\t"6"\n'
+                f'\t"name"\t\t"Game {app_id}"\n}}\n'
+            )
+            games.append(
+                GameEntry(
+                    GameSource.STEAM,
+                    app_id,
+                    f"Game {app_id}",
+                    old_game.steam_root,
+                    old_game.library_root,
+                )
+            )
+        self.window.games = games
+
+        with patch.object(QMessageBox, "warning", return_value=QMessageBox.Yes):
+            self.window.skip_all_updates()
+
+        for app_id in (41, 42):
+            with (steamapps / f"appmanifest_{app_id}.acf").open() as handle:
+                self.assertEqual(vdf.load(handle)["AppState"]["StateFlags"], "4")
 
     def test_runtime_options_round_trip_through_profile_editor(self):
         self.window.gamemode_checkbox.setChecked(True)
@@ -211,6 +318,74 @@ class UiTests(unittest.TestCase):
 
         self.window.followup_group.setChecked(False)
         self.assertFalse(self.window.followup_launch_now_button.isEnabled())
+
+    def test_session_controls_and_console_follow_selected_game(self):
+        first = self.window.current_game()
+        second_executable = self.tmp / "Second" / "Second.exe"
+        second_executable.parent.mkdir()
+        second_executable.touch()
+        second = GameEntry(
+            GameSource.SHORTCUT,
+            43,
+            "Second",
+            first.steam_root,
+            first.library_root,
+            shortcut_exe=str(second_executable),
+        )
+        self.window.games.append(second)
+        self.window.game_combo.addItem(second.label, second.key)
+        first_record = SessionRecord(
+            "first-session",
+            "primary",
+            first.key,
+            first.name,
+            str(first.default_prefix),
+            "process-group",
+        )
+
+        self.window._log("first output", first.key)
+        self.window._update_session_buttons([first_record])
+        self.assertFalse(self.window.launch_button.isEnabled())
+
+        self.window.game_combo.setCurrentIndex(1)
+        self.window._log("second output", second.key)
+        self.window._update_session_buttons([first_record])
+        self.assertTrue(self.window.launch_button.isEnabled())
+        self.assertEqual(self.window.log.toPlainText(), "second output")
+
+        self.window.clear_log_button.click()
+        self.assertEqual(self.window.log.toPlainText(), "")
+        self.window.game_combo.setCurrentIndex(0)
+        self.assertEqual(self.window.log.toPlainText(), "first output")
+
+    def test_stop_all_only_stops_selected_game_sessions(self):
+        game = self.window.current_game()
+        selected = SessionRecord(
+            "selected",
+            "primary",
+            game.key,
+            game.name,
+            str(game.default_prefix),
+            "process-group",
+        )
+        other = SessionRecord(
+            "other",
+            "primary",
+            "shortcut:99",
+            "Other",
+            str(self.tmp / "other-prefix"),
+            "process-group",
+        )
+        with (
+            patch.object(
+                self.window.sessions, "active", return_value=[selected, other]
+            ),
+            patch.object(self.window.sessions, "stop") as stop,
+            patch.object(self.window, "_refresh_sessions"),
+        ):
+            self.window.stop_all()
+
+        stop.assert_called_once_with(selected)
 
     def test_steam_launch_option_updates_direct_launch_fields(self):
         old_game = self.window.current_game()
@@ -358,9 +533,19 @@ class UiTests(unittest.TestCase):
         self.window.store.settings["wemod_launcher_path"] = str(launcher)
         self.window._update_wemod_status()
         self.assertTrue(self.window.launch_wemod_button.isEnabled())
-        with patch.object(self.window.sessions, "records", return_value=[object()]):
-            self.window._update_wemod_status()
+        self.window.active_sessions = [
+            SessionRecord(
+                "wemod",
+                "wemod",
+                self.window.current_game().key,
+                self.window.current_game().name,
+                str(self.window.current_game().default_prefix),
+                "process-group",
+            )
+        ]
+        self.window._update_wemod_status()
         self.assertFalse(self.window.launch_wemod_button.isEnabled())
+        self.window.active_sessions = []
         self.window._update_wemod_status()
 
         with (

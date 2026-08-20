@@ -58,6 +58,7 @@ from proton_launcher.steam import (
     parse_manifest,
     parse_shortcuts,
     resolve_game_executable,
+    set_manifest_state_flags,
 )
 from proton_launcher.wemod_bridge import (
     STEAM_RETRY_NATIVE_APP_ID,
@@ -634,6 +635,178 @@ class CoreTests(unittest.TestCase):
         self.assertIsNotNone(game)
         self.assertEqual(game.app_id, 42)
         self.assertEqual(game.install_dir, library / "steamapps" / "common" / "A Game")
+
+    def test_set_manifest_state_flags_preserves_manifest_format(self):
+        root, library = self.tmp / "Steam", self.tmp / "Library"
+        steamapps = library / "steamapps"
+        steamapps.mkdir(parents=True)
+        manifest = steamapps / "appmanifest_42.acf"
+        manifest.write_bytes(
+            b'"AppState"\r\n{\r\n\t"appid"\t\t"42"\r\n'
+            b'\t"StateFlags"\t\t"1026"\r\n\t"name"\t\t"A Game"\r\n}\r\n'
+        )
+        game = GameEntry(GameSource.STEAM, 42, "A Game", root, library)
+
+        self.assertEqual(set_manifest_state_flags(game), manifest)
+
+        self.assertEqual(
+            manifest.read_bytes(),
+            b'"AppState"\r\n{\r\n\t"appid"\t\t"42"\r\n'
+            b'\t"StateFlags"\t\t"4"\r\n\t"name"\t\t"A Game"\r\n}\r\n',
+        )
+
+    def test_manifest_state_flags_ignores_nested_values(self):
+        root, library = self.tmp / "Steam", self.tmp / "Library"
+        steamapps = library / "steamapps"
+        steamapps.mkdir(parents=True)
+        manifest = steamapps / "appmanifest_42.acf"
+        manifest.write_bytes(
+            b'"AppState"\n{\n\t"appid" "42"\n\t"Nested"\n\t{\n'
+            b'\t\t"StateFlags" "99"\n\t}\n\t"StateFlags" "6"\n}\n'
+        )
+        game = GameEntry(GameSource.STEAM, 42, "A Game", root, library)
+
+        set_manifest_state_flags(game)
+
+        self.assertIn(b'\t\t"StateFlags" "99"', manifest.read_bytes())
+        self.assertIn(b'\t"StateFlags" "4"', manifest.read_bytes())
+
+    def test_manifest_state_flags_rejects_nested_only_value(self):
+        root, library = self.tmp / "Steam", self.tmp / "Library"
+        steamapps = library / "steamapps"
+        steamapps.mkdir(parents=True)
+        manifest = steamapps / "appmanifest_42.acf"
+        original = (
+            b'"AppState"\n{\n\t"appid" "42"\n\t"Nested"\n\t{\n'
+            b'\t\t"StateFlags" "99"\n\t}\n}\n'
+        )
+        manifest.write_bytes(original)
+        game = GameEntry(GameSource.STEAM, 42, "A Game", root, library)
+
+        with self.assertRaisesRegex(ValueError, "direct AppState StateFlags"):
+            set_manifest_state_flags(game)
+
+        self.assertEqual(manifest.read_bytes(), original)
+
+    def test_manifest_state_flags_normalizes_parser_syntax_errors(self):
+        root, library = self.tmp / "Steam", self.tmp / "Library"
+        manifest = library / "steamapps" / "appmanifest_42.acf"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text('"AppState"\n{\n')
+        game = GameEntry(GameSource.STEAM, 42, "A Game", root, library)
+
+        with patch(
+            "proton_launcher.steam._text_vdf", side_effect=SyntaxError("broken VDF")
+        ):
+            with self.assertRaisesRegex(ValueError, "Could not read"):
+                set_manifest_state_flags(game)
+
+    def test_manifest_state_flags_handles_comments_and_escaped_quotes(self):
+        root, library = self.tmp / "Steam", self.tmp / "Library"
+        manifest = library / "steamapps" / "appmanifest_42.acf"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_bytes(
+            b'// manifest comment\n"AppState"\n{\n\t"appid" "42"\n'
+            b'\t"note" "value with \\"quote\\""\n\t"StateFlags" "6"\n}\n'
+        )
+        game = GameEntry(GameSource.STEAM, 42, "A Game", root, library)
+
+        set_manifest_state_flags(game)
+
+        updated = manifest.read_bytes()
+        self.assertIn(b"// manifest comment", updated)
+        self.assertIn(b'"note" "value with \\"quote\\""', updated)
+        self.assertIn(b'"StateFlags" "4"', updated)
+
+    def test_manifest_state_flags_rejects_duplicate_direct_values(self):
+        root, library = self.tmp / "Steam", self.tmp / "Library"
+        manifest = library / "steamapps" / "appmanifest_42.acf"
+        manifest.parent.mkdir(parents=True)
+        original = (
+            b'"AppState"\n{\n\t"appid" "42"\n\t"StateFlags" "6"\n'
+            b'\t"StateFlags" "8"\n}\n'
+        )
+        manifest.write_bytes(original)
+        game = GameEntry(GameSource.STEAM, 42, "A Game", root, library)
+
+        with self.assertRaisesRegex(ValueError, "found 2"):
+            set_manifest_state_flags(game)
+
+        self.assertEqual(manifest.read_bytes(), original)
+
+    def test_native_launch_runs_executable_without_proton(self):
+        root, library = self.tmp / "Steam", self.tmp / "Library"
+        executable = self.tmp / "native-game"
+        executable.write_text("#!/bin/sh\n")
+        executable.chmod(0o755)
+        game = GameEntry(GameSource.SHORTCUT, 42, "Native", root, library)
+        profile = LaunchProfile(
+            "native",
+            "Native",
+            game.key,
+            use_native_runtime=True,
+            executable=str(executable),
+            arguments='--name "Native Game"',
+            environment_text="NATIVE_TEST=yes",
+        )
+
+        with patch.dict("proton_launcher.runner.os.environ", {}, clear=True):
+            spec = build_launch_spec(game, profile)
+            tagged = build_launch_spec(game, profile, session_id="abc123")
+
+        self.assertEqual(spec.program, str(executable))
+        self.assertEqual(spec.arguments, ["--name", "Native Game"])
+        self.assertEqual(spec.working_directory, str(executable.parent))
+        self.assertEqual(spec.environment["NATIVE_TEST"], "yes")
+        self.assertNotIn("STEAM_COMPAT_DATA_PATH", spec.environment)
+        self.assertNotIn("PROTON_LAUNCHER_SESSION_ID", spec.environment)
+
+        self.assertEqual(tagged.environment["PROTON_LAUNCHER_SESSION_ID"], "abc123")
+
+    def test_native_command_preserves_relative_program_path(self):
+        game = GameEntry(
+            GameSource.SHORTCUT,
+            42,
+            "Native",
+            self.tmp / "Steam",
+            self.tmp / "Library",
+        )
+        profile = LaunchProfile(
+            "native",
+            "Native",
+            game.key,
+            use_native_runtime=True,
+            mode="command",
+            command="./start-game --native",
+            working_directory=str(self.tmp),
+        )
+
+        spec = build_launch_spec(game, profile)
+
+        self.assertEqual(spec.program, "./start-game")
+        self.assertEqual(spec.arguments, ["--native"])
+
+    def test_native_hdr_requires_gamescope(self):
+        executable = self.tmp / "native-game"
+        executable.touch(mode=0o755)
+        game = GameEntry(
+            GameSource.SHORTCUT,
+            42,
+            "Native",
+            self.tmp / "Steam",
+            self.tmp / "Library",
+        )
+        profile = LaunchProfile(
+            "native",
+            "Native",
+            game.key,
+            use_native_runtime=True,
+            executable=str(executable),
+            enable_hdr=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "Native HDR requires Gamescope"):
+            build_launch_spec(game, profile)
 
     def test_manifest_uses_steam_launch_executable(self):
         root, library = self.tmp / "Steam", self.tmp / "Library"
@@ -1633,6 +1806,22 @@ class CoreTests(unittest.TestCase):
             (folder / "cmdline").write_bytes(b"Z:\\Games\\Game.exe\0")
             (folder / "comm").write_text("wine64-preloader\n")
         self.assertEqual(find_matching_pids("Game.exe", prefix, proc), {100})
+
+    def test_process_watcher_filters_native_launch_by_session_id(self):
+        proc = self.tmp / "proc"
+        proc.mkdir()
+        for pid, session_id in (("100", "selected"), ("200", "other")):
+            folder = proc / pid
+            folder.mkdir()
+            (folder / "environ").write_bytes(
+                f"A=1\0PROTON_LAUNCHER_SESSION_ID={session_id}\0".encode()
+            )
+            (folder / "cmdline").write_bytes(b"./Game\0")
+            (folder / "comm").write_text("Game\n")
+
+        self.assertEqual(
+            find_matching_pids("Game", None, proc, session_id="selected"), {100}
+        )
 
     def test_discovers_steam_managed_proton_from_common(self):
         library = self.tmp / "Library"

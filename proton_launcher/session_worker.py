@@ -46,11 +46,14 @@ def _exec(spec: dict[str, Any]) -> None:
 def _wait_and_exec(payload: dict[str, Any], record: Path) -> None:
     watch = payload["watch"]
     target = str(watch["target"])
-    prefix = Path(watch["prefix"])
+    raw_prefix = str(watch["prefix"])
+    prefix = Path(raw_prefix) if raw_prefix else None
+    session_id = str(watch.get("session_id", ""))
     baseline = {int(item) for item in watch.get("baseline", [])}
-    print(f"Watching for {target} in {prefix}", flush=True)
+    location = str(prefix) if prefix is not None else "all host processes"
+    print(f"Watching for {target} in {location}", flush=True)
     while True:
-        launched = find_matching_pids(target, prefix) - baseline
+        launched = find_matching_pids(target, prefix, session_id=session_id) - baseline
         if launched:
             break
         time.sleep(0.25)

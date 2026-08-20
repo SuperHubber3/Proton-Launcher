@@ -36,6 +36,11 @@ class RuntimeOptionsDialog(QDialog):
             self.tabs.setTabToolTip(
                 1, "Unavailable because Gamescope is incompatible with WeMod"
             )
+        if profile.use_native_runtime:
+            self.tabs.setTabEnabled(2, False)
+            self.tabs.setTabToolTip(
+                2, "These options only apply to Proton and Wine programs"
+            )
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -83,6 +88,17 @@ class RuntimeOptionsDialog(QDialog):
         ):
             self.dxvk_hud.addItem(label, value)
         self.dxvk_hud.setCurrentIndex(max(0, self.dxvk_hud.findData(profile.dxvk_hud)))
+        if profile.use_native_runtime:
+            self.hdr.setText("Enable HDR through Gamescope")
+            unavailable = "This option only applies to Proton and Wine programs"
+            for widget in (
+                self.force_nvapi,
+                self.raw_input,
+                self.sdl_input,
+                self.dxvk_hud,
+            ):
+                widget.setEnabled(False)
+                widget.setToolTip(unavailable)
         form.addRow("GPU", self.discrete_gpu)
         form.addRow("HDR", self.hdr)
         form.addRow("NVIDIA", self.force_nvapi)

@@ -116,8 +116,12 @@ class SessionManager:
         watch_target: str = "",
         watch_baseline: set[int] | None = None,
         delay_seconds: float = 0.0,
+        watch_any_prefix: bool = False,
+        watch_session_id: str = "",
         steam_managed: bool = False,
     ) -> SessionRecord:
+        if watch_target and watch_any_prefix and not watch_session_id:
+            raise ValueError("Prefix-free process watching requires a session ID")
         session_id = uuid.uuid4().hex
         unit = f"proton-launcher-{kind.value}-{session_id}.service"
         log_path = self.logs_dir / f"{session_id}.log"
@@ -147,7 +151,8 @@ class SessionManager:
             "watch": (
                 {
                     "target": watch_target,
-                    "prefix": str(prefix),
+                    "prefix": "" if watch_any_prefix else str(prefix),
+                    "session_id": watch_session_id,
                     "baseline": sorted(watch_baseline or set()),
                     "delay_seconds": delay_seconds,
                 }

@@ -36,16 +36,28 @@ def command_matches(cmdline: bytes, comm: str, target: str) -> bool:
 
 
 def find_matching_pids(
-    target: str, prefix: Path, proc_root: Path = Path("/proc")
+    target: str,
+    prefix: Path | None,
+    proc_root: Path = Path("/proc"),
+    session_id: str = "",
 ) -> set[int]:
     result: set[int] = set()
-    expected = os.fsencode(f"STEAM_COMPAT_DATA_PATH={prefix}")
+    expected = (
+        os.fsencode(f"STEAM_COMPAT_DATA_PATH={prefix}") if prefix is not None else None
+    )
+    expected_session = (
+        os.fsencode(f"PROTON_LAUNCHER_SESSION_ID={session_id}") if session_id else None
+    )
+    if prefix is None and expected_session is None:
+        raise ValueError("Process matching requires a prefix or session ID")
     for entry in proc_root.iterdir():
         if not entry.name.isdigit():
             continue
         try:
             environment = (entry / "environ").read_bytes().split(b"\0")
-            if expected not in environment:
+            if expected is not None and expected not in environment:
+                continue
+            if expected_session is not None and expected_session not in environment:
                 continue
             cmdline = (entry / "cmdline").read_bytes()
             comm = (entry / "comm").read_text(errors="replace")
