@@ -11,16 +11,16 @@ from pathlib import Path
 from typing import Any
 
 from .process_watcher import find_matching_pids
+from .sessions import merge_record_fields
+
+# Steam can spend minutes on shader compilation, prefix maintenance, or a
+# game's own launcher before the first prefix process appears.
+STEAM_LAUNCH_TIMEOUT = 300.0
 
 
 def _update_record(path: Path, phase: str) -> None:
     try:
-        data = json.loads(path.read_text())
-        data["phase"] = phase
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, path)
+        merge_record_fields(path, {"phase": phase})
     except (OSError, ValueError, TypeError):
         pass
 
@@ -73,11 +73,6 @@ def _steam_managed(payload: dict[str, Any], record: Path) -> int:
     prefix = Path(payload["prefix"])
     baseline = _prefix_pids(prefix)
     environment = {str(key): str(value) for key, value in spec["environment"].items()}
-    request = subprocess.Popen(
-        [str(spec["program"]), *[str(item) for item in spec.get("arguments", [])]],
-        cwd=str(spec["working_directory"]),
-        env=environment,
-    )
     tracked: set[int] = set()
     stopping = False
 
@@ -86,19 +81,37 @@ def _steam_managed(payload: dict[str, Any], record: Path) -> int:
         stopping = True
 
     signal.signal(signal.SIGTERM, terminate)
-    deadline = time.monotonic() + 90
+    request = subprocess.Popen(
+        [str(spec["program"]), *[str(item) for item in spec.get("arguments", [])]],
+        cwd=str(spec["working_directory"]),
+        env=environment,
+    )
+    deadline = time.monotonic() + STEAM_LAUNCH_TIMEOUT
     empty_since: float | None = None
+    running_reported = False
     while True:
+        request.poll()
         current = _prefix_pids(prefix) - baseline
         tracked |= current
         if current:
-            _update_record(record, "running")
+            if not running_reported:
+                _update_record(record, "running")
+                running_reported = True
             empty_since = None
         elif tracked:
             empty_since = empty_since or time.monotonic()
             if time.monotonic() - empty_since >= 2:
                 return 0
-        elif request.poll() is not None and time.monotonic() >= deadline:
+        elif request.returncode is not None and time.monotonic() >= deadline:
+            # Steam may still be compiling shaders or showing a launcher, so
+            # this only fires long after the request command itself exited.
+            print(
+                f"No game process appeared in {prefix} within "
+                f"{STEAM_LAUNCH_TIMEOUT:.0f} seconds of the Steam request "
+                f"exiting (code {request.returncode}); giving up on this "
+                "session. The game may still start through Steam.",
+                flush=True,
+            )
             return request.returncode or 0
         if stopping:
             for pid in _prefix_pids(prefix) - baseline:

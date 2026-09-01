@@ -73,7 +73,13 @@ def save_cached_mapping(mapping: WeModGameMapping, path: Path | None = None) -> 
     cache_path = path or mapping_file()
     try:
         value = json.loads(cache_path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
+    except FileNotFoundError:
+        value = {}
+    except OSError:
+        # A transient read failure must not rewrite the cache with only the
+        # current game; corrupt content (handled below) is different.
+        return
+    except (UnicodeError, json.JSONDecodeError):
         value = {}
     if (
         not isinstance(value, dict)

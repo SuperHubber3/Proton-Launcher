@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-only
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import struct
@@ -397,7 +398,10 @@ class CoreTests(unittest.TestCase):
         retry_helper = library / "Steam.exe"
         retry_marker = library / ".proton-launcher-steam-retry"
         retry_helper.touch()
-        retry_marker.write_text("Managed by Proton Launcher.\n")
+        retry_marker.write_text(
+            "Managed by Proton Launcher.\n"
+            f"sha256={hashlib.sha256(b'').hexdigest()}\n"
+        )
         game_file = prefix / "pfx" / "drive_c" / "game" / "save.dat"
         game_file.parent.mkdir(parents=True)
         game_file.touch()
@@ -508,7 +512,8 @@ class CoreTests(unittest.TestCase):
         self.assertEqual((library / "Steam.exe").read_bytes(), b"helper")
         self.assertEqual(
             (library / ".proton-launcher-steam-retry").read_text(),
-            "Managed by Proton Launcher.\n",
+            "Managed by Proton Launcher.\n"
+            f"sha256={hashlib.sha256(b'helper').hexdigest()}\n",
         )
 
     def test_wemod_steam_retry_helper_does_not_replace_unknown_steam_exe(self):
@@ -525,6 +530,47 @@ class CoreTests(unittest.TestCase):
             (library / "Steam.exe").read_bytes(),
             b"existing",
         )
+
+    def test_wemod_steam_retry_helper_does_not_replace_updated_steam_exe(self):
+        library = self.tmp / "library"
+        helper = self.tmp / "steam-retry-helper.exe"
+        library.mkdir()
+        helper.write_bytes(b"helper")
+        _prepare_steam_retry_helper(library, helper)
+        # A Windows Steam self-update rewrote the helper with the real client.
+        (library / "Steam.exe").write_bytes(b"genuine steam client")
+
+        with self.assertRaisesRegex(OSError, "existing Steam.exe"):
+            _prepare_steam_retry_helper(library, helper)
+
+        self.assertEqual((library / "Steam.exe").read_bytes(), b"genuine steam client")
+
+    def test_wemod_steam_retry_removal_leaves_updated_steam_exe(self):
+        from proton_launcher.wemod_bridge import _remove_steam_retry_helper
+
+        library = self.tmp / "library"
+        helper = self.tmp / "steam-retry-helper.exe"
+        library.mkdir()
+        helper.write_bytes(b"helper")
+        _prepare_steam_retry_helper(library, helper)
+        (library / "Steam.exe").write_bytes(b"genuine steam client")
+
+        removed = _remove_steam_retry_helper(library)
+
+        self.assertEqual(removed, [library / ".proton-launcher-steam-retry"])
+        self.assertEqual((library / "Steam.exe").read_bytes(), b"genuine steam client")
+
+    def test_wemod_steam_retry_helper_upgrade_replaces_owned_helper(self):
+        library = self.tmp / "library"
+        helper = self.tmp / "steam-retry-helper.exe"
+        library.mkdir()
+        helper.write_bytes(b"helper v1")
+        _prepare_steam_retry_helper(library, helper)
+        helper.write_bytes(b"helper v2")
+
+        _prepare_steam_retry_helper(library, helper)
+
+        self.assertEqual((library / "Steam.exe").read_bytes(), b"helper v2")
 
     def test_wemod_steam_retry_restores_game_launch_environment(self):
         game_environment = {
@@ -654,6 +700,24 @@ class CoreTests(unittest.TestCase):
             b'"AppState"\r\n{\r\n\t"appid"\t\t"42"\r\n'
             b'\t"StateFlags"\t\t"4"\r\n\t"name"\t\t"A Game"\r\n}\r\n',
         )
+
+    def test_manifest_edit_refuses_ambiguous_backslash_values(self):
+        root, library = self.tmp / "Steam", self.tmp / "Library"
+        steamapps = library / "steamapps"
+        steamapps.mkdir(parents=True)
+        manifest = steamapps / "appmanifest_42.acf"
+        original = (
+            b'"AppState"\n{\n\t"appid"\t\t"42"\n'
+            b'\t"installdir"\t\t"D:\\Games\\"\n'
+            b'\t"StateFlags"\t\t"6"\n}\n'
+        )
+        manifest.write_bytes(original)
+        game = GameEntry(GameSource.STEAM, 42, "A Game", root, library)
+
+        with self.assertRaisesRegex(ValueError, "could not be verified"):
+            set_manifest_state_flags(game)
+
+        self.assertEqual(manifest.read_bytes(), original)
 
     def test_manifest_state_flags_ignores_nested_values(self):
         root, library = self.tmp / "Steam", self.tmp / "Library"

@@ -24,7 +24,7 @@ def _manifest_identity(root: Path) -> tuple[str, str]:
         if tools:
             tool_id, entry = next(iter(tools.items()))
             return str(entry.get("display_name") or root.name), str(tool_id)
-    except (OSError, ValueError, AttributeError):
+    except (OSError, ValueError, SyntaxError, TypeError, AttributeError):
         pass
     return root.name, ""
 
@@ -101,7 +101,7 @@ def discover_steam_default_tool(steam_roots: list[Path]) -> str:
             name = str(mapping.get("name", "")).strip()
             if name:
                 return name
-        except (OSError, ValueError, AttributeError):
+        except (OSError, ValueError, SyntaxError, TypeError, AttributeError):
             continue
     return ""
 

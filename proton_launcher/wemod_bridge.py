@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -57,6 +58,38 @@ def _steam_retry_paths(library: Path) -> tuple[Path, Path]:
     return library / "Steam.exe", library / STEAM_RETRY_MARKER
 
 
+def _marker_recorded_hash(marker: Path) -> str | None:
+    try:
+        for line in marker.read_text(encoding="utf-8").splitlines():
+            if line.startswith("sha256="):
+                return line.removeprefix("sha256=").strip()
+    except OSError:
+        pass
+    return None
+
+
+def _launcher_owns_helper(destination: Path, marker: Path) -> bool:
+    """Report whether Steam.exe at the destination is the launcher's helper.
+
+    Steam can replace the helper with a genuine client executable (a Windows
+    Steam self-update in a shared library); never touch a file the launcher
+    cannot prove it wrote.
+    """
+    try:
+        destination_bytes = destination.read_bytes()
+    except OSError:
+        return False
+    recorded = _marker_recorded_hash(marker)
+    if recorded is not None:
+        return hashlib.sha256(destination_bytes).hexdigest() == recorded
+    # Markers written before hashes were recorded: fall back to comparing
+    # against the shipped helper.
+    try:
+        return destination_bytes == STEAM_RETRY_HELPER.read_bytes()
+    except OSError:
+        return False
+
+
 def _remove_steam_retry_helper(library: Path) -> list[Path]:
     destination, marker = _steam_retry_paths(library.resolve(strict=False))
     if not marker.is_file():
@@ -65,8 +98,16 @@ def _remove_steam_retry_helper(library: Path) -> list[Path]:
         raise OSError(f"Refusing to remove a non-file path: {destination}")
     removed = []
     if destination.is_file():
-        destination.unlink()
-        removed.append(destination)
+        if _launcher_owns_helper(destination, marker):
+            destination.unlink()
+            removed.append(destination)
+        else:
+            print(
+                f"Leaving {destination} alone: it is no longer the "
+                "Proton Launcher helper",
+                file=sys.stderr,
+                flush=True,
+            )
     marker.unlink()
     removed.append(marker)
     return removed
@@ -129,11 +170,27 @@ def _prepare_steam_retry_helper(
     destination, marker = _steam_retry_paths(library)
     if destination.exists() and not destination.is_file():
         raise OSError(f"Refusing to replace a non-file path: {destination}")
-    if destination.is_file() and not marker.is_file():
-        if destination.read_bytes() != helper.read_bytes():
+    helper_bytes = helper.read_bytes()
+    if destination.is_file():
+        destination_bytes = destination.read_bytes()
+        if destination_bytes != helper_bytes and not (
+            marker.is_file() and _launcher_owns_helper(destination, marker)
+        ):
             raise OSError(f"Refusing to replace an existing Steam.exe: {destination}")
-    shutil.copy2(helper, destination)
-    marker.write_text("Managed by Proton Launcher.\n", encoding="utf-8")
+    # Record the hash before copying so a failed copy can never strand an
+    # unowned helper, then replace atomically to avoid partial files.
+    marker.write_text(
+        "Managed by Proton Launcher.\n"
+        f"sha256={hashlib.sha256(helper_bytes).hexdigest()}\n",
+        encoding="utf-8",
+    )
+    temporary = destination.with_name(f".{destination.name}.proton-launcher")
+    try:
+        shutil.copy2(helper, temporary)
+        os.replace(temporary, destination)
+    except OSError:
+        temporary.unlink(missing_ok=True)
+        raise
     return library
 
 
@@ -425,6 +482,11 @@ def _wait_until_wemod_ready(
     ready_since: float | None = None
     while time.monotonic() < deadline:
         if process.poll() is not None:
+            # A clean exit while WeMod processes are alive is Electron's
+            # single-instance handoff to an already-running WeMod.
+            if process.returncode == 0 and _wemod_processes():
+                print("WeMod handed off to a running instance", flush=True)
+                return True
             return False
         current = {
             pid: command
@@ -455,7 +517,11 @@ def main() -> int:
         )
         return 2
     proton, wemod_executable, encoded_arguments = sys.argv[1:4]
-    game_arguments = json.loads(encoded_arguments)
+    try:
+        game_arguments = json.loads(encoded_arguments)
+    except json.JSONDecodeError:
+        print("Invalid game argument list", file=sys.stderr)
+        return 2
     if not isinstance(game_arguments, list) or not all(
         isinstance(item, str) for item in game_arguments
     ):

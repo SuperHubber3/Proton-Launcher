@@ -469,6 +469,8 @@ class ConfigValidator:
                     )
                 )
         allowed_values = {
+            "mode": {"executable", "command"},
+            "followup_mode": {"executable", "command"},
             "dxvk_hud": {"off", "fps", "1", "full"},
             "gamescope_window_mode": {"borderless", "fullscreen", "windowed"},
             "gamescope_scaler": {"auto", "integer", "fit", "fill", "stretch"},
@@ -495,12 +497,12 @@ class ConfigValidator:
                 )
             )
         delay = profile.get("followup_delay")
-        if not isinstance(delay, int | float) or isinstance(delay, bool):
+        if not isinstance(delay, int | float) or isinstance(delay, bool) or delay < 0:
             issues.append(
                 ValidationIssue(
                     f"{path}.followup_delay",
                     "error",
-                    "follow-up delay must be a number",
+                    "follow-up delay must be a non-negative number",
                 )
             )
         return changed

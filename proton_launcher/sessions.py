@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-only
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import signal
@@ -37,6 +38,7 @@ class SessionRecord:
     start_ticks: int = 0
     phase: str = "starting"
     log_path: str = ""
+    parent_id: str = ""
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> SessionRecord:
@@ -58,6 +60,35 @@ def runtime_root() -> Path:
         os.environ.get("XDG_RUNTIME_DIR", f"/tmp/proton-launcher-{os.getuid()}")
     )
     return base / "proton-launcher"
+
+
+def merge_record_fields(path: Path, updates: dict[str, Any]) -> None:
+    """Merge fields into a record file under an exclusive lock.
+
+    Both the manager and the session worker update the same record file from
+    different processes; whole-file rewrites would let one side erase the
+    other's fields.
+    """
+    lock_path = path.with_suffix(".lock")
+    with open(lock_path, "w", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            data = {}
+        data.update(updates)
+        fd, temporary = tempfile.mkstemp(prefix=f".{path.name}-", dir=path.parent)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
 
 def process_start_ticks(pid: int) -> int:
@@ -184,9 +215,20 @@ class SessionManager:
                     f"--working-directory={project_root}",
                     *worker,
                 ]
-                result = subprocess.run(
-                    command, capture_output=True, text=True, check=False, timeout=8
-                )
+                try:
+                    result = subprocess.run(
+                        command, capture_output=True, text=True, check=False, timeout=8
+                    )
+                except subprocess.TimeoutExpired as error:
+                    # The unit may have been created anyway; stop it so a game
+                    # the manager no longer tracks is not left running.
+                    subprocess.run(
+                        ["systemctl", "--user", "--no-block", "stop", unit],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                    )
+                    raise OSError(f"systemd-run did not respond: {error}") from error
                 if result.returncode:
                     raise OSError(result.stderr.strip() or result.stdout.strip())
             else:
@@ -201,15 +243,22 @@ class SessionManager:
                 record.pid = process.pid
                 record.start_ticks = process_start_ticks(process.pid)
                 self._children[record.id] = process
-                self._write_record(record)
+                merge_record_fields(
+                    record_path,
+                    {"pid": record.pid, "start_ticks": record.start_ticks},
+                )
         except Exception:
             spec_path.unlink(missing_ok=True)
             record_path.unlink(missing_ok=True)
             raise
         return record
 
+    ACTIVE_UNIT_STATES = frozenset(
+        {"active", "activating", "deactivating", "reloading"}
+    )
+
     def active(self) -> list[SessionRecord]:
-        result: list[SessionRecord] = []
+        pending: list[tuple[Path, SessionRecord]] = []
         for path in self.records_dir.glob("*.json"):
             if path in self._finished_records:
                 continue
@@ -220,39 +269,90 @@ class SessionManager:
             if record.phase == "finished":
                 self._finished_records.add(path)
                 continue
-            if self.is_active(record):
+            pending.append((path, record))
+        # One batched systemctl query per poll; per-record calls block the UI
+        # thread for up to two seconds each when the user manager is slow.
+        unit_states = self._unit_states(
+            [
+                record.unit
+                for _, record in pending
+                if record.backend == "systemd" and record.unit
+            ]
+        )
+        result: list[SessionRecord] = []
+        for path, record in pending:
+            if record.backend == "systemd" and record.unit:
+                alive = unit_states.get(record.unit, "") in self.ACTIVE_UNIT_STATES
+            else:
+                alive = self._local_process_alive(record)
+            if alive:
                 result.append(record)
             else:
                 record.phase = "finished"
                 self._write_record(record)
                 self._finished_records.add(path)
+        self._cancel_orphaned_followups(result)
         return sorted(result, key=lambda item: item.id)
+
+    def _cancel_orphaned_followups(self, active_records: list[SessionRecord]) -> None:
+        """Stop waiting follow-ups whose primary session already finished."""
+        active_ids = {record.id for record in active_records}
+        for record in active_records:
+            if (
+                record.kind == SessionKind.FOLLOWUP.value
+                and record.phase == "waiting"
+                and record.parent_id
+                and record.parent_id not in active_ids
+            ):
+                self._append_log(
+                    record,
+                    "Stopping the follow-up: the game session ended before "
+                    "the watched program appeared",
+                )
+                self.stop(record)
+                record.phase = "stopping"
+
+    @staticmethod
+    def _append_log(record: SessionRecord, message: str) -> None:
+        if not record.log_path:
+            return
+        try:
+            with open(record.log_path, "a", encoding="utf-8") as handle:
+                handle.write(message + "\n")
+        except OSError:
+            pass
+
+    @staticmethod
+    def _unit_states(units: list[str]) -> dict[str, str]:
+        if not units:
+            return {}
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "show", "--property=Id,ActiveState", *units],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=3,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return {}
+        states: dict[str, str] = {}
+        unit_id = ""
+        for line in result.stdout.splitlines():
+            if line.startswith("Id="):
+                unit_id = line.removeprefix("Id=").strip()
+            elif line.startswith("ActiveState=") and unit_id:
+                states[unit_id] = line.removeprefix("ActiveState=").strip()
+                unit_id = ""
+        return states
 
     def is_active(self, record: SessionRecord) -> bool:
         if record.backend == "systemd" and record.unit:
-            try:
-                result = subprocess.run(
-                    [
-                        "systemctl",
-                        "--user",
-                        "show",
-                        "--property=ActiveState",
-                        "--value",
-                        record.unit,
-                    ],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=2,
-                )
-                return result.stdout.strip() in {
-                    "active",
-                    "activating",
-                    "deactivating",
-                    "reloading",
-                }
-            except (OSError, subprocess.TimeoutExpired):
-                return False
+            states = self._unit_states([record.unit])
+            return states.get(record.unit, "") in self.ACTIVE_UNIT_STATES
+        return self._local_process_alive(record)
+
+    def _local_process_alive(self, record: SessionRecord) -> bool:
         child = self._children.get(record.id)
         if child is not None:
             if child.poll() is None:
@@ -273,13 +373,16 @@ class SessionManager:
             self._write_record(record)
             return
         if record.backend == "systemd" and record.unit:
-            subprocess.run(
-                ["systemctl", "--user", "--no-block", "stop", record.unit],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-                timeout=2,
-            )
+            try:
+                subprocess.run(
+                    ["systemctl", "--user", "--no-block", "stop", record.unit],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=2,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
         elif record.pid and process_start_ticks(record.pid) == record.start_ticks:
             try:
                 os.killpg(record.pid, signal.SIGTERM)
@@ -291,7 +394,7 @@ class SessionManager:
                 daemon=True,
             ).start()
         record.phase = "stopping"
-        self._write_record(record)
+        merge_record_fields(self._record_path(record.id), {"phase": "stopping"})
 
     @staticmethod
     def _force_fallback_after_timeout(pid: int, start_ticks: int) -> None:
@@ -302,6 +405,11 @@ class SessionManager:
             os.killpg(pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+
+    def link_parent(self, record: SessionRecord, parent_id: str) -> None:
+        """Tie a follow-up to its primary session for automatic cancellation."""
+        record.parent_id = parent_id
+        merge_record_fields(self._record_path(record.id), {"parent_id": parent_id})
 
     def records(self, kind: SessionKind | None = None) -> list[SessionRecord]:
         records = self.active()

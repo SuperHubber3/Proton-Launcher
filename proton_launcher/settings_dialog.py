@@ -168,6 +168,12 @@ class SettingsDialog(QDialog):
         configured = store.settings["default_proton"]
         wanted = (configured["mode"], configured.get("path", ""))
         index = self.default_proton.findData(wanted)
+        if index < 0 and wanted[0] == "explicit":
+            # Keep an explicit choice that is not currently discovered (for
+            # example a Proton on an unmounted drive) instead of silently
+            # saving "Follow Steam" over it.
+            self.default_proton.addItem(f"{wanted[1]} (not found)", wanted)
+            index = self.default_proton.count() - 1
         self.default_proton.setCurrentIndex(max(0, index))
         self.close_behavior = QComboBox()
         for label, value in (

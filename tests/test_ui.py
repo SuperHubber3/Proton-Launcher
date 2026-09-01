@@ -583,5 +583,31 @@ class UiTests(unittest.TestCase):
         self.assertTrue(game_file.is_file())
 
 
+class InteractiveRepairTests(unittest.TestCase):
+    def test_find_json_value_locates_missing_keys(self):
+        from proton_launcher.__main__ import _find_json_value
+
+        document = {"games": {"a.b": {"profiles": {"default": {}}}}}
+        parent, key, current = _find_json_value(
+            document, "$.games.a.b.profiles.default.mode"
+        )
+        self.assertIs(parent, document["games"]["a.b"]["profiles"]["default"])
+        self.assertEqual(key, "mode")
+        self.assertIsNone(current)
+
+        parent, key, current = _find_json_value({"format": "x"}, "$.schema_version")
+        self.assertEqual(key, "schema_version")
+        self.assertIsNone(current)
+
+    def test_find_json_value_still_locates_existing_keys(self):
+        from proton_launcher.__main__ import _find_json_value
+
+        document = {"settings": {"close_behavior": "ask"}}
+        parent, key, current = _find_json_value(document, "$.settings.close_behavior")
+        self.assertIs(parent, document["settings"])
+        self.assertEqual(key, "close_behavior")
+        self.assertEqual(current, "ask")
+
+
 if __name__ == "__main__":
     unittest.main()

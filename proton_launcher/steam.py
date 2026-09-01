@@ -1,10 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-only
 from __future__ import annotations
 
-import os
-import re
 import struct
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -12,51 +9,17 @@ import vdf
 
 from .models import DiscoveryIssue, GameEntry, GameSource, SteamLaunchOption
 from .util import expanded_path, unquote_path
+from .vdf_edit import atomic_write, replace_scalar_values
 
 DEFAULT_STEAM_ROOTS = ("~/.local/share/Steam", "~/.steam/steam")
-VDF_TOKEN = re.compile(rb'//[^\r\n]*|"(?:\\.|[^"\\])*"|[{}]|[^\s{}"]+')
-
-
-def _direct_app_state_value_spans(
-    data: bytes, wanted_key: str
-) -> list[tuple[int, int]]:
-    """Find scalar values belonging directly to the top-level AppState object."""
-    contexts: list[dict[str, Any]] = [{"pending": None, "app_state": False}]
-    spans: list[tuple[int, int]] = []
-    for match in VDF_TOKEN.finditer(data):
-        token = match.group()
-        if token.startswith(b"//"):
-            continue
-        context = contexts[-1]
-        if token == b"{":
-            key = context["pending"]
-            is_app_state = len(contexts) == 1 and key == "appstate"
-            context["pending"] = None
-            contexts.append({"pending": None, "app_state": is_app_state})
-            continue
-        if token == b"}":
-            if len(contexts) > 1:
-                contexts.pop()
-            continue
-
-        value = token[1:-1] if token.startswith(b'"') else token
-        text = value.decode("utf-8", errors="replace").casefold()
-        if context["pending"] is None:
-            context["pending"] = text
-            continue
-        if context["app_state"] and context["pending"] == wanted_key.casefold():
-            start, end = match.span()
-            if token.startswith(b'"'):
-                start += 1
-                end -= 1
-            spans.append((start, end))
-        context["pending"] = None
-    return spans
 
 
 def _text_vdf(path: Path) -> dict[str, Any]:
     with path.open(encoding="utf-8", errors="replace") as handle:
-        return vdf.load(handle)
+        try:
+            return vdf.load(handle)
+        except (SyntaxError, TypeError, AttributeError) as error:
+            raise ValueError(f"Malformed VDF in {path}: {error}") from error
 
 
 def appmanifest_path(game: GameEntry) -> Path:
@@ -79,31 +42,21 @@ def set_manifest_state_flags(game: GameEntry, state_flags: int = 4) -> Path:
         original = manifest.read_bytes()
     except OSError as error:
         raise ValueError(f"Could not read {manifest}: {error}") from error
-    spans = _direct_app_state_value_spans(original, "StateFlags")
-    if len(spans) != 1:
-        raise ValueError(
-            f"Expected one direct AppState StateFlags entry in {manifest}, "
-            f"found {len(spans)}"
-        )
-    start, end = spans[0]
-    updated = original[:start] + str(state_flags).encode("ascii") + original[end:]
-
-    temporary_path: Path | None = None
     try:
-        with tempfile.NamedTemporaryFile(
-            dir=manifest.parent,
-            prefix=f".{manifest.name}.",
-            delete=False,
-        ) as temporary:
-            temporary_path = Path(temporary.name)
-            temporary.write(updated)
-            temporary.flush()
-            os.fsync(temporary.fileno())
-        temporary_path.chmod(manifest.stat().st_mode)
-        os.replace(temporary_path, manifest)
-    except OSError as error:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
+        updated = replace_scalar_values(
+            original, {("AppState", "StateFlags"): str(state_flags)}
+        )
+        # The byte-level editor can compute a wrong span on unusual content
+        # (for example a value ending in a lone backslash); prove the edited
+        # document still parses to the intended change before writing it.
+        try:
+            reparsed = vdf.loads(updated.decode("utf-8", errors="replace"))
+        except (SyntaxError, TypeError, AttributeError, ValueError) as error:
+            raise ValueError(f"The edited manifest no longer parses: {error}")
+        if str(reparsed.get("AppState", {}).get("StateFlags", "")) != str(state_flags):
+            raise ValueError("The manifest edit could not be verified")
+        atomic_write(manifest, updated)
+    except (OSError, ValueError) as error:
         raise ValueError(f"Could not update {manifest}: {error}") from error
     return manifest
 

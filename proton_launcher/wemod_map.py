@@ -50,7 +50,11 @@ def map_patch_backup(asar: Path) -> Path:
 
 
 def _replace_file(path: Path, data: bytes) -> None:
-    mode = path.stat().st_mode
+    try:
+        mode = path.stat().st_mode
+    except FileNotFoundError:
+        # Restoring from backup can recreate a deleted app.asar.
+        mode = 0o644
     temporary_name = ""
     try:
         with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as temporary:
@@ -98,7 +102,7 @@ def restore_wemod_maps(asar: Path) -> bool:
     state = map_patch_state(asar)
     if state == "available":
         return False
-    if state != "patched":
+    if state not in ("patched", "missing"):
         raise ValueError("The installed WeMod map code is not recognized")
     backup = map_patch_backup(asar)
     if map_patch_state(backup) != "available":

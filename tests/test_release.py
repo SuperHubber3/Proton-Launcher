@@ -51,6 +51,28 @@ class ReleaseTests(unittest.TestCase):
         self.assertFalse(report.errors)
         self.assertEqual(report.repaired["settings"]["close_behavior"], "ask")
 
+    def test_negative_followup_delay_is_rejected(self):
+        store = ConfigStore(self.tmp / "config.json")
+        key = "shortcut:/steam:1"
+        store.ensure_game(key)
+        value = store.data
+        value["games"][key]["profiles"]["default"]["followup_delay"] = -5
+
+        report = ConfigValidator.validate(value)
+
+        self.assertTrue(any("followup_delay" in issue.path for issue in report.errors))
+
+    def test_unknown_launch_mode_is_rejected(self):
+        store = ConfigStore(self.tmp / "config.json")
+        key = "shortcut:/steam:1"
+        store.ensure_game(key)
+        value = store.data
+        value["games"][key]["profiles"]["default"]["mode"] = "exec"
+
+        report = ConfigValidator.validate(value)
+
+        self.assertTrue(any(issue.path.endswith(".mode") for issue in report.errors))
+
     def test_obsolete_custom_wemod_overrides_are_removed(self):
         store = ConfigStore(self.tmp / "config.json")
         key = "shortcut:/steam:1"
@@ -247,6 +269,48 @@ class ReleaseTests(unittest.TestCase):
                     watch_any_prefix=True,
                 )
 
+    def test_waiting_followup_is_cancelled_when_primary_finishes(self):
+        environment = {
+            "XDG_STATE_HOME": str(self.tmp / "state"),
+            "XDG_RUNTIME_DIR": str(self.tmp / "runtime"),
+        }
+        with (
+            patch.dict(os.environ, environment),
+            patch.object(SessionManager, "_detect_systemd", return_value=False),
+        ):
+            manager = SessionManager()
+            spec = LaunchSpec("/usr/bin/sleep", ["30"], dict(os.environ), str(self.tmp))
+            followup = manager.start(
+                SessionKind.FOLLOWUP,
+                spec,
+                "game",
+                "Game",
+                self.tmp / "prefix",
+                watch_target="never-appears.exe",
+                watch_baseline=set(),
+            )
+            primary = manager.start(
+                SessionKind.PRIMARY, spec, "game", "Game", self.tmp / "prefix"
+            )
+            manager.link_parent(followup, primary.id)
+            for _ in range(30):
+                if {record.id for record in manager.active()} >= {
+                    followup.id,
+                    primary.id,
+                }:
+                    break
+                time.sleep(0.05)
+
+            manager.stop(primary)
+            for _ in range(100):
+                active_ids = {record.id for record in manager.active()}
+                if followup.id not in active_ids:
+                    break
+                time.sleep(0.05)
+            self.assertNotIn(followup.id, active_ids)
+            log_text = Path(followup.log_path).read_text()
+            self.assertIn("Stopping the follow-up", log_text)
+
     def test_systemd_deactivating_session_remains_active(self):
         environment = {
             "XDG_STATE_HOME": str(self.tmp / "state"),
@@ -267,7 +331,13 @@ class ReleaseTests(unittest.TestCase):
                 unit="proton-launcher-stopping.service",
                 phase="stopping",
             )
-            result = subprocess.CompletedProcess([], 0, stdout="deactivating\n")
+            result = subprocess.CompletedProcess(
+                [],
+                0,
+                stdout=(
+                    "Id=proton-launcher-stopping.service\n" "ActiveState=deactivating\n"
+                ),
+            )
             with patch("proton_launcher.sessions.subprocess.run", return_value=result):
                 self.assertTrue(manager.is_active(record))
 

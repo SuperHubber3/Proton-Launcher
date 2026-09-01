@@ -81,6 +81,13 @@ def _find_json_value(value, wanted: str, path: str = "$"):
             result = _find_json_value(child, wanted, child_path)
             if result is not None:
                 return result
+        # Validator errors also name keys that are absent (e.g. a missing
+        # schema_version); attach them here so the replacement does not become
+        # the whole document.
+        if wanted.startswith(f"{path}."):
+            remainder = wanted[len(path) + 1 :]
+            if "." not in remainder:
+                return value, remainder, None
     return None
 
 

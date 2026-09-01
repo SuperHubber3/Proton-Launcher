@@ -31,6 +31,8 @@ Steam overlay, or launch a second program after the game starts.
 - Keeps game and follow-up sessions available after the window closes, with
   separate Stop controls and an optional system tray.
 - Lets you open, replace, or delete a prefix from the toolbar.
+- Switches between accounts already saved by Steam and can disable Steam's
+  shader pre-caching during the switch.
 
 ## Requirements
 
@@ -168,6 +170,21 @@ system's first discrete GPU. Custom environment entries still apply; an
 enabled toggle takes precedence when both set the same variable.
 
 ## Steam and overlay options
+
+**Switch account** lists the accounts already saved by Steam. Proton Launcher
+closes Steam, changes its saved-account selector, and restarts it. It does not
+store passwords or session tokens. Steam asks for a sign-in when the selected
+account has no remembered login.
+
+Steam can queue the same shader depots again after an account change. Enable
+**Disable Steam shader pre-caching** in the switch dialog to stop those
+downloads. Games will compile missing shaders during play instead, which can
+cause stutter. The setting belongs to Steam and remains in effect until you
+turn it back off in the same dialog or in Steam's settings.
+
+Small game updates after a switch are normal Steam depot updates when the
+installed build is behind the current manifest. Account switching does not
+change appmanifest state or suppress game updates.
 
 **Launch through Steam** asks Steam to start the selected game or shortcut.
 Steam then owns the Proton choice, launch options, and game process.

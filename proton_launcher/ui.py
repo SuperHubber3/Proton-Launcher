@@ -4,6 +4,7 @@ from __future__ import annotations
 import shlex
 import shutil
 import subprocess
+import time
 import uuid
 from dataclasses import replace
 from pathlib import Path
@@ -80,6 +81,8 @@ from .steam import (
     discover_steam_roots,
     set_manifest_state_flags,
 )
+from .steam_account_dialog import SteamAccountDialog
+from .steam_accounts import load_account_state, steam_is_running, switch_account
 from .wemod_bridge import reset_wemod_prefix
 
 APP_ICON = Path(__file__).resolve().parent.parent / "assets" / "proton-launcher.svg"
@@ -179,6 +182,8 @@ class MainWindow(QMainWindow):
         file_menu = self.menuBar().addMenu("File")
         settings_action = file_menu.addAction("Settings…")
         settings_action.triggered.connect(self.open_settings)
+        switch_account_action = file_menu.addAction("Switch Steam account…")
+        switch_account_action.triggered.connect(self.switch_steam_account)
         quit_action = file_menu.addAction("Quit")
         quit_action.triggered.connect(self._quit_from_menu)
         tools_menu = self.menuBar().addMenu("Tools")
@@ -196,6 +201,7 @@ class MainWindow(QMainWindow):
         for text, callback in (
             ("Refresh", self.refresh),
             ("Settings…", self.open_settings),
+            ("Switch account…", self.switch_steam_account),
             ("Set prefix…", self.set_prefix),
             ("Open prefix", self.open_prefix),
             ("Delete prefix…", self.delete_prefix),
@@ -497,6 +503,169 @@ class MainWindow(QMainWindow):
         self._followup_mode_changed()
         self._update_session_buttons([])
 
+    def _account_steam_root(self) -> Path | None:
+        return next(
+            (
+                root
+                for root in self.steam_roots
+                if (root / "config" / "loginusers.vdf").is_file()
+                and (root / "config" / "config.vdf").is_file()
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _steam_executable(steam_root: Path) -> str | None:
+        executable = shutil.which("steam")
+        if executable:
+            return executable
+        steam_script = steam_root / "steam.sh"
+        return str(steam_script) if steam_script.is_file() else None
+
+    @staticmethod
+    def _start_steam(executable: str) -> None:
+        subprocess.Popen(
+            [executable],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+    def switch_steam_account(self) -> None:
+        if getattr(self, "_switching_steam_account", False):
+            return
+        if self.sessions.active():
+            QMessageBox.warning(
+                self,
+                "Sessions are running",
+                "Stop all Proton Launcher sessions before switching Steam accounts.",
+            )
+            return
+        steam_root = self._account_steam_root()
+        if steam_root is None:
+            QMessageBox.warning(
+                self,
+                "Steam accounts unavailable",
+                "No Steam installation with saved account data was found.",
+            )
+            return
+        try:
+            state = load_account_state(steam_root)
+        except ValueError as error:
+            QMessageBox.warning(self, "Steam accounts unavailable", str(error))
+            return
+
+        dialog = SteamAccountDialog(state, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        steam_id = dialog.selected_steam_id()
+        disable_shaders = dialog.disable_shader_cache.isChecked()
+        # Steam rewrites these files while it runs, so re-read before deciding
+        # that nothing changed.
+        try:
+            state = load_account_state(steam_root)
+        except ValueError as error:
+            QMessageBox.warning(self, "Steam accounts unavailable", str(error))
+            return
+        target = next(
+            (account for account in state.accounts if account.steam_id == steam_id),
+            None,
+        )
+        if target is None:
+            QMessageBox.warning(
+                self,
+                "Steam accounts unavailable",
+                "The selected account is no longer saved by Steam.",
+            )
+            return
+        if (
+            steam_id == state.current_steam_id
+            and disable_shaders == state.shader_cache_disabled
+        ):
+            self.status.setText("Steam account settings are unchanged")
+            return
+
+        warning = (
+            f"Switch Steam to {target.label}?\n\n"
+            "Steam and any games it manages will close. Proton Launcher will update "
+            "only Steam's saved-account selector and shader pre-caching setting, "
+            "then restart Steam."
+        )
+        if not target.remember_password:
+            warning += "\n\nSteam may ask you to sign in to this account."
+        answer = QMessageBox.warning(
+            self,
+            "Switch Steam account?",
+            warning,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        executable = self._steam_executable(steam_root)
+        if not executable:
+            QMessageBox.warning(
+                self, "Steam unavailable", "The Steam executable could not be found."
+            )
+            return
+        was_running = steam_is_running(steam_root)
+        progress = QProgressDialog("Closing Steam…", "", 0, 0, self)
+        progress.setWindowTitle("Switch Steam account")
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setCancelButton(None)
+        progress.setMinimumDuration(0)
+        self._switching_steam_account = True
+        try:
+            if was_running:
+                shutdown = subprocess.Popen(
+                    [executable, "-shutdown"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                deadline = time.monotonic() + 30
+                while steam_is_running(steam_root) and time.monotonic() < deadline:
+                    shutdown.poll()
+                    QApplication.processEvents()
+                    time.sleep(0.1)
+                if shutdown.poll() is None:
+                    shutdown.terminate()
+                    try:
+                        shutdown.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        shutdown.kill()
+                        shutdown.wait()
+                if steam_is_running(steam_root):
+                    raise ValueError(
+                        "Steam did not close within 30 seconds. No settings were changed."
+                    )
+            progress.setLabelText("Updating Steam account settings…")
+            QApplication.processEvents()
+            switch_account(steam_root, steam_id, disable_shaders)
+            progress.setLabelText("Restarting Steam…")
+            QApplication.processEvents()
+            self._start_steam(executable)
+        except (OSError, ValueError) as error:
+            if was_running and not steam_is_running(steam_root):
+                try:
+                    self._start_steam(executable)
+                except OSError:
+                    pass
+            QMessageBox.critical(self, "Could not switch Steam account", str(error))
+            self._log(f"Steam account switch failed: {error}")
+            return
+        finally:
+            self._switching_steam_account = False
+            progress.close()
+
+        shader_status = "disabled" if disable_shaders else "enabled"
+        self.status.setText(f"Steam is restarting as {target.label}")
+        self._log(
+            f"Switched Steam account to {target.label}; shader pre-caching {shader_status}"
+        )
+
     def _build_tray(self) -> None:
         self.tray = QSystemTrayIcon(self.windowIcon(), self)
         menu = self.tray.contextMenu() or None
@@ -587,11 +756,11 @@ class MainWindow(QMainWindow):
         self.game_combo.clear()
         for game in self.games:
             self.game_combo.addItem(game.label, game.key)
-        self.game_combo.blockSignals(False)
         index = self.game_combo.findData(selected)
         self.game_combo.setCurrentIndex(
             index if index >= 0 else (0 if self.games else -1)
         )
+        self.game_combo.blockSignals(False)
         self.game_count_label.setText(f"{len(self.games)} games")
         self.proton_count_label.setText(f"{len(self.protons)} Proton versions")
         for issue in [*issues, *proton_issues]:
@@ -798,11 +967,9 @@ class MainWindow(QMainWindow):
             self.active_session_signature = None
             self._update_session_view(self.active_sessions)
             return
-        if (
-            self.named_profile_dirty
-            and self.current_profile
-            and self.current_profile.game_key != game.key
-        ):
+        if self.named_profile_dirty and self.current_profile:
+            # Also fires when the game is unchanged: Refresh and "New profile"
+            # re-enter here and would otherwise reload over unsaved edits.
             old_game = next(
                 (
                     item
@@ -1072,7 +1239,13 @@ class MainWindow(QMainWindow):
             if profile.use_native_runtime
             else "__default__" if profile.use_default_proton else profile.proton_path
         )
-        self.proton_combo.setCurrentIndex(max(0, self.proton_combo.findData(wanted)))
+        index = self.proton_combo.findData(wanted)
+        if index < 0 and wanted not in ("__default__", "__native__", ""):
+            # Keep a Proton path that is not currently discovered (for example
+            # on an unmounted drive) so an autosave cannot erase the choice.
+            self.proton_combo.addItem(f"{wanted} (not found)", wanted)
+            index = self.proton_combo.count() - 1
+        self.proton_combo.setCurrentIndex(max(0, index))
         self.proton_combo.blockSignals(False)
         self._update_proton_tooltip()
 
@@ -1253,6 +1426,11 @@ class MainWindow(QMainWindow):
                 raise ValueError(
                     "Launch with WeMod cannot be combined with Launch through Steam"
                 )
+            if profile.launch_through_steam and profile.use_native_runtime:
+                raise ValueError(
+                    "Launch through Steam cannot be combined with "
+                    "the native Linux runtime"
+                )
             if profile.launch_wemod and not self.store.settings["wemod_launcher_path"]:
                 wemod, _ = QFileDialog.getOpenFileName(
                     self, "Choose WeMod Launcher", str(Path.home())
@@ -1317,6 +1495,8 @@ class MainWindow(QMainWindow):
                 prefix,
                 steam_managed=profile.launch_through_steam,
             )
+            if followup_record is not None:
+                self.sessions.link_parent(followup_record, record.id)
             self._register_session(record)
             self._log("$ " + shlex.join([spec.program, *spec.arguments]), game.key)
             self.status.setText(f"Launched {game.name}")
@@ -2038,21 +2218,34 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
 
+    def _flush_pending_state(self) -> None:
+        if self.autosave_timer.isActive():
+            self._autosave_default()
+        try:
+            self.store.save()
+        except OSError as error:
+            self._log(f"Could not save the configuration: {error}")
+
     def _quit_from_menu(self) -> None:
-        self.close()
+        self._quitting_from_menu = True
+        try:
+            self.close()
+        finally:
+            self._quitting_from_menu = False
 
     def _quit_keep_sessions(self) -> None:
+        self._flush_pending_state()
         self._force_quit = True
         QApplication.quit()
 
     def _stop_and_quit(self) -> None:
+        self._flush_pending_state()
         self.sessions.stop_all()
         self._force_quit = True
         QApplication.quit()
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        if self.autosave_timer.isActive():
-            self._autosave_default()
+        self._flush_pending_state()
         if self._force_quit:
             event.accept()
             return
@@ -2062,6 +2255,9 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, QApplication.quit)
             return
         behavior = self.store.settings["close_behavior"]
+        if behavior == "tray" and getattr(self, "_quitting_from_menu", False):
+            # An explicit File → Quit must never end up merely hiding to tray.
+            behavior = "ask"
         if behavior == "ask":
             box = QMessageBox(self)
             box.setWindowTitle("Sessions are still running")
